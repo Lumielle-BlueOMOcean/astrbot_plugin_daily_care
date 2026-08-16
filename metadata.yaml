@@ -3,7 +3,7 @@ display_name: "微光-Daily Care"
 author: "Lumielle"
 version: "v1.00"
 desc: "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。"
-repo: ""
+repo: "https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_daily_care"
 astrbot_version: ">=4.12.0"
 support_platforms:
   - aiocqhttp
