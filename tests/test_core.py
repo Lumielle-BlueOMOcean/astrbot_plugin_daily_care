@@ -702,6 +702,70 @@ def test_daily_note_text():
     assert "寒冷" in t6, t6
     print("✓ 常态天气提示文本（温度区间映射）测试通过")
 
+def test_note_windows_multi():
+    """1.0.0：常态提示时段多选+自定义——解析与命中判断"""
+    from core.decision import _parse_note_windows, _in_note_window
+    from datetime import datetime as _dt
+
+    # JSON 数组字符串
+    assert _parse_note_windows('["morning","07:00-08:00"]') == ["morning", "07:00-08:00"]
+    # 逗号分隔
+    assert _parse_note_windows("morning,noon") == ["morning", "noon"]
+    # 单个
+    assert _parse_note_windows("evening") == ["evening"]
+    # 空
+    assert _parse_note_windows("") == []
+    assert _parse_note_windows(None) == []
+    # 已是列表
+    assert _parse_note_windows(["night"]) == ["night"]
+
+    # 预设窗口命中
+    assert _in_note_window(_dt(2026, 8, 16, 9, 0), ["morning"])
+    assert not _in_note_window(_dt(2026, 8, 16, 12, 0), ["morning"])
+    # 自定义时段命中
+    assert _in_note_window(_dt(2026, 8, 16, 7, 30), ["07:00-08:00"])
+    assert not _in_note_window(_dt(2026, 8, 16, 8, 30), ["07:00-08:00"])
+    # 跨天自定义时段
+    assert _in_note_window(_dt(2026, 8, 16, 23, 30), ["22:00-02:00"])
+    assert _in_note_window(_dt(2026, 8, 17, 1, 0), ["22:00-02:00"])
+    assert not _in_note_window(_dt(2026, 8, 17, 3, 0), ["22:00-02:00"])
+    # 多选任一命中
+    assert _in_note_window(_dt(2026, 8, 16, 18, 0), ["morning", "evening"])
+    # 空列表不命中
+    assert not _in_note_window(_dt(2026, 8, 16, 9, 0), [])
+    print("✓ 常态提示时段多选+自定义（解析/命中/跨天）测试通过")
+
+
+def test_daily_note_gap():
+    """1.0.0：常态提示间隔控制——距上次生成不足 gap 分钟不生成"""
+    db = make_db()
+    t_id = db.get_default_target()["id"]
+    loc_id = db.upsert_location("重庆", 29.56, 106.55, "dynamic", "重庆")
+
+    def _no_dnd(self):
+        return False
+
+    wx = {"today": {"desc": "晴", "tmax": 31.0, "tmin": 24.0, "precip_prob": 10.0}}
+
+    # gap=0：不限制间隔（兼容旧行为）
+    mon = CareMonitor(db, {"enable_daily_weather_note": True, "daily_weather_note_limit": 3,
+                           "daily_weather_note_gap_min": 0, "dnd_start": "23:00", "dnd_end": "08:00"})
+    mon._in_dnd = _no_dnd.__get__(mon)
+    n1 = mon._try_daily_note(t_id, loc_id, "重庆", wx, "2026-08-16")
+    assert n1 is not None, "gap=0 应生成"
+    n2 = mon._try_daily_note(t_id, loc_id, "重庆", wx, "2026-08-16")
+    assert n2 is not None, "gap=0 不限制间隔，应继续生成"
+
+    # gap=60：短时间第二次被间隔拦截
+    db.kv_set("last_daily_note_ts", int(__import__("time").time()))
+    mon2 = CareMonitor(db, {"enable_daily_weather_note": True, "daily_weather_note_limit": 3,
+                            "daily_weather_note_gap_min": 60, "dnd_start": "23:00", "dnd_end": "08:00"})
+    mon2._in_dnd = _no_dnd.__get__(mon2)
+    n3 = mon2._try_daily_note(t_id, loc_id, "重庆", wx, "2026-08-16")
+    assert n3 is None, "距上次不足60分钟应被间隔拦截"
+    print("✓ 常态提示间隔控制测试通过")
+
+
 
 def test_daily_note_flow():
     """v1.01：常态天气提示生成链路——开关/勿扰/特殊天气去重/计数上限"""
@@ -720,8 +784,9 @@ def test_daily_note_flow():
     n1 = mon._try_daily_note(t_id, loc_id, "重庆", wx, "2026-08-16")
     assert n1 is None, "开关关闭不应生成"
 
-    # 开关开启：生成
+    # 开关开启：生成（gap=0 不限制间隔，本测试专注 limit 与跨天）
     mon = CareMonitor(db, {"enable_daily_weather_note": True, "daily_weather_note_limit": 1,
+                           "daily_weather_note_gap_min": 0,
                            "dnd_start": "23:00", "dnd_end": "08:00"})
     mon._in_dnd = _no_dnd.__get__(mon)
     n2 = mon._try_daily_note(t_id, loc_id, "重庆", wx, "2026-08-16")
@@ -900,6 +965,8 @@ if __name__ == "__main__":
     test_seen_mark_after_main_analysis()
     test_decision_category_track()
     test_daily_note_text()
+    test_note_windows_multi()
+    test_daily_note_gap()
     test_daily_note_flow()
     test_weather_lifecycle()
     test_city_switch_invalidate()

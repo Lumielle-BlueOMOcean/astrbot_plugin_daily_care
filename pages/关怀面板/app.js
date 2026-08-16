@@ -86,7 +86,8 @@ const FORM_META = {
     ["enable_qweather_alerts", "启用和风预警窗口", true, "启用灾害预警"],
     ["enable_daily_weather_note", "常态天气提示", false, "无特殊天气也每天问候一次天气"],
     ["daily_weather_note_limit", "常态提示次数/天", "1", "每日常态天气提示次数上限"],
-    ["daily_weather_note_window", "常态提示时段", "morning", "倾向时段：morning/noon/evening"],
+    ["daily_weather_note_gap_min", "常态提示间隔(分钟)", "60", "两次常态提示的最小间隔"],
+    ["daily_weather_note_window", "常态提示时段", '["morning"]', "可多选预设时段，也可自定义 HH:MM-HH:MM", "window-multi"],
   ],
   decision: [
     ["weather_tool_enabled", "天气工具(对话中可用)", true, "对话中可查询天气"],
@@ -134,6 +135,26 @@ function buildForm(containerId, meta, values) {
       input = `<div class="range-wrap"><input type="range" min="1" max="10" step="1" data-key="${key}" value="${esc(String(val))}" /><span class="range-val" data-range="${key}">${esc(String(val))}</span></div>`;
     } else if (type === "time") {
       input = `<input type="time" data-key="${key}" value="${esc(String(val))}" />`;
+    } else if (type === "window-multi") {
+      const wins = parseWindows(val);
+      const presets = [
+        ["morning", "早上 8-11"],
+        ["noon", "中午 11-14"],
+        ["evening", "傍晚 17-20"],
+        ["night", "晚上 20-23"],
+      ];
+      const presetBoxes = presets.map(([w, label]) =>
+        `<label class="win-chk"><input type="checkbox" data-key="${key}" data-win="${w}" ${wins.indexOf(w) >= 0 ? "checked" : ""} />${label}</label>`
+      ).join("");
+      const customs = wins.filter((w) => !["morning", "noon", "evening", "night"].includes(w));
+      const customTags = customs.map((w) =>
+        `<span class="win-tag" data-key="${key}" data-custom-win="${w}">${esc(w)} <b data-del-win="${w}">×</b></span>`
+      ).join("");
+      input = `<div class="win-multi" data-key="${key}" data-win-multi="1">
+        <div class="win-presets">${presetBoxes}</div>
+        <div class="win-custom">${customTags}<span class="muted" data-placeholder="${key}" style="${customs.length ? "display:none" : ""}">暂无自定义时段</span></div>
+        <div class="win-add"><input type="text" data-add-win="${key}" placeholder="HH:MM-HH:MM，如 07:00-08:00" /><button type="button" class="btn btn-ghost btn-sm" data-add-btn="${key}">添加</button></div>
+      </div>`;
     } else {
       input = `<input type="text" data-key="${key}" value="${esc(String(val))}" />`;
     }
@@ -142,16 +163,75 @@ function buildForm(containerId, meta, values) {
   });
 }
 
+function parseWindows(val) {
+  if (!val) return [];
+  if (Array.isArray(val)) return val;
+  if (typeof val === "string") {
+    try {
+      const a = JSON.parse(val);
+      if (Array.isArray(a)) return a;
+    } catch (e) {}
+    return val.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  return [];
+}
+
 function collectForm(containerId) {
   const out = {};
+  const multi = {};
   document.querySelectorAll(`#${containerId} [data-key]`).forEach((el) => {
     const k = el.dataset.key;
+    if (el.dataset.winMulti !== undefined) {
+      const presets = Array.from(el.querySelectorAll("input[data-win]:checked")).map((x) => x.dataset.win);
+      const customs = Array.from(el.querySelectorAll("[data-custom-win]")).map((x) => x.dataset.customWin);
+      multi[k] = JSON.stringify(presets.concat(customs));
+      return;
+    }
+    if (el.hasAttribute("data-win")) return;
     if (el.type === "checkbox") out[k] = el.checked;
     else if (el.type === "range") out[k] = parseInt(el.value, 10);
     else out[k] = el.value;
   });
+  Object.assign(out, multi);
   return out;
 }
+
+// window-multi 自定义时段：添加/删除（事件委托）
+document.addEventListener("click", (e) => {
+  const del = e.target.closest("[data-del-win]");
+  if (del) {
+    const tag = del.closest("[data-custom-win]");
+    if (tag) tag.remove();
+    const container = tag.closest(".win-multi");
+    const ph = container.querySelector("[data-placeholder]");
+    if (ph && !container.querySelector("[data-custom-win]")) ph.style.display = "";
+    return;
+  }
+  const addBtn = e.target.closest("[data-add-btn]");
+  if (addBtn) {
+    const key = addBtn.dataset.addBtn;
+    const container = addBtn.closest(".win-multi");
+    const input = container.querySelector(`[data-add-win="${key}"]`);
+    const val = (input.value || "").trim();
+    if (val && /^\d{2}:\d{2}-\d{2}:\d{2}$/.test(val)) {
+      const dup = Array.from(container.querySelectorAll("[data-custom-win]")).some((x) => x.dataset.customWin === val);
+      if (!dup) {
+        const span = document.createElement("span");
+        span.className = "win-tag";
+        span.dataset.key = key;
+        span.dataset.customWin = val;
+        span.innerHTML = esc(val) + ` <b data-del-win="${esc(val)}">×</b>`;
+        const area = container.querySelector(".win-custom");
+        const ph = area.querySelector("[data-placeholder]");
+        if (ph) ph.style.display = "none";
+        area.insertBefore(span, ph);
+      }
+      input.value = "";
+    } else {
+      alert("自定义时段格式：HH:MM-HH:MM，如 07:00-08:00");
+    }
+  }
+});
 
 // ---------- 渲染 ----------
 function esc(s) {
@@ -395,7 +475,7 @@ function showAction(msg) {
   t._timer = setTimeout(() => t.classList.remove("show"), 6000);
 }
 
-document.querySelectorAll("#weatherSettings, #decisionSettings, #proactiveSettings, #generalSettings").forEach((form) => {
+document.querySelectorAll("#weatherSettings, #decisionSettings, #proactiveSettings, #globalSettings, #targetsSettings").forEach((form) => {
   const save = document.createElement("button");
   save.className = "btn btn-primary btn-sm form-save";
   save.textContent = "保存本区设置";

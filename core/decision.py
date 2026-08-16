@@ -24,6 +24,7 @@ DecisionEngine 输入：
 3. 防重复靠"让决策 LLM 看到最近说过什么"，而非硬规则去重。
 """
 import json
+import re
 import time
 from datetime import datetime, date, timedelta
 from typing import Any, Optional
@@ -43,6 +44,53 @@ WINDOWS = {
 WINDOW_LABEL = {
     "morning": "早上", "noon": "中午", "evening": "傍晚", "night": "晚上",
 }
+
+
+def _parse_note_windows(cfg_val) -> list:
+    """解析常态提示倾向时段配置为列表。
+
+    兼容三种格式：JSON 数组字符串（'["morning","07:00-08:00"]'）、
+    逗号分隔（'morning,noon'）、单个（'morning'）。
+    """
+    if not cfg_val:
+        return []
+    if isinstance(cfg_val, list):
+        return [str(x).strip() for x in cfg_val if str(x).strip()]
+    s = str(cfg_val)
+    try:
+        arr = json.loads(s)
+        if isinstance(arr, list):
+            return [str(x).strip() for x in arr if str(x).strip()]
+    except Exception:
+        pass
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def _in_note_window(now, windows: list) -> bool:
+    """当前时刻是否命中任一倾向时段。
+
+    预设窗口名（morning/noon/evening/night）直接查 WINDOWS；
+    自定义时段（HH:MM-HH:MM）按分钟区间判断，支持跨天（22:00-02:00）。
+    """
+    if not windows:
+        return False
+    cur = now.hour * 60 + now.minute
+    for w in windows:
+        if w in WINDOWS:
+            sh, eh = WINDOWS[w]
+            if sh * 60 <= cur < eh * 60:
+                return True
+        else:
+            m = re.match(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$", w)
+            if m:
+                s = int(m.group(1)) * 60 + int(m.group(2))
+                e = int(m.group(3)) * 60 + int(m.group(4))
+                if s < e:
+                    if s <= cur < e:
+                        return True
+                elif cur >= s or cur < e:
+                    return True
+    return False
 
 
 def window_of_now(now: Optional[datetime] = None) -> Optional[str]:
@@ -126,8 +174,10 @@ class DecisionEngine:
                 f"- [{tag}] {created}：{e['summary']}"
                 + (f"（{e['detail']}）" if e.get("detail") and e["source"] == "state" else "")
             )
-        # 常态天气提示倾向时段（v1.01）
-        daily_note_window = str(self.config.get("daily_weather_note_window", "morning") or "morning")
+        # 常态天气提示倾向时段（1.0.0：多选+自定义，解析为列表）
+        daily_note_windows = _parse_note_windows(
+            self.config.get("daily_weather_note_window", '["morning"]')
+        )
         # 静默时长（冷场主动消息用）
         last_user = self.db.kv_get("last_user_msg_ts", 0)
         silence_min = int((time.time() - last_user) / 60) if last_user else 0
@@ -144,7 +194,8 @@ class DecisionEngine:
             "now": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "window": window_of_now() or "无",
             "silence_minutes": silence_min,
-            "daily_note_window": daily_note_window,
+            "daily_note_windows": daily_note_windows,
+            "in_note_window": _in_note_window(datetime.now(), daily_note_windows),
             "target_name": target.get("name", "你"),
             "guarantee": self._guarantee,
         }
@@ -174,7 +225,7 @@ class DecisionEngine:
             "可以考虑 act——这是主动开启话题的自然契机，background 写客观事实如"
             "'我们有一阵子没说话了'；但若静默时间过短（<60分钟）不要 act，避免打扰。\n"
             "9. 若事件中有『常态天气提示』（cause 含 daily-note）：这是每天固定的天气问候，"
-            "属于低优先级日常关怀——若当前处于其倾向时段（morning/noon/evening）且并非"
+            "属于低优先级日常关怀——若『当前在倾向时段内』为真（见用户输入）且并非"
             "勿扰时段、今日开口不多，倾向 act，background 直接用该事件的天气事实；"
             "若刚提醒过同类内容（见『最近提醒过』）则 silent，避免重复。\n"
             "10. category 字段（仅 act 时需要）：若 background 引用的是天气事实（如天气预警、显著变化、常态天气问候），输出 weather；若引用用户状态（不适/情绪/作息等），输出 state；若因静默冷场主动开启话题，输出 proactive。这用于消息分轨计数，请如实归类。\n"
@@ -199,7 +250,8 @@ class DecisionEngine:
             f"今日关怀消息 {ctx['today_count']}/{ctx['daily_limit']} 条",
             f"关怀积极度：{ctx['care_level']}/10（越高越倾向于主动开口）",
             f"上次开口：{ctx['last_send']}",
-            f"常态天气提示倾向时段：{ctx.get('daily_note_window', 'morning')}（仅在存在常态天气事件时参考）",
+            f"常态天气提示倾向时段：{', '.join(ctx.get('daily_note_windows', []) or ['morning']) or '无'}（仅在存在常态天气事件时参考）"
+            + (f"，当前{'在' if ctx.get('in_note_window') else '不在'}倾向时段内" if ctx.get('daily_note_windows') else ""),
         ]
         if ctx.get("guarantee"):
             user_lines.append("⚠️ 本次为保底触发：静默已达最大窗口，必须开口。")

@@ -109,9 +109,9 @@
   },
   "daily_weather_note_window": {
     "type": "string",
-    "description": "常态天气提示倾向的发送时段（morning/noon/evening）",
+    "description": "常态天气提示倾向时段列表（JSON 数组，可多选预设窗口+自定义 HH:MM-HH:MM，如 [\"morning\",\"07:00-08:00\"]）",
     "hint": "常态提示倾向时段",
-    "default": "morning"
+    "default": "[\"morning\"]"
   },
   "care_cooldown_minutes": {
     "type": "int",
@@ -172,5 +172,11 @@
     "description": "平台实例 ID（默认 auto 自动解析）",
     "hint": "平台实例ID",
     "default": "auto"
+  },
+  "daily_weather_note_gap_min": {
+    "type": "int",
+    "description": "两次常态天气提示的最小间隔（分钟）",
+    "hint": "常态提示间隔",
+    "default": 60
   }
 }

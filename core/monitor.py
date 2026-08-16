@@ -103,7 +103,14 @@ class CareMonitor:
                 cnt = 0
         if cnt >= limit:
             return None
+        # 1.0.0：间隔控制——距上次常态提示不足 gap 分钟不生成（防短时间连续）
+        gap_min = self.config.get("daily_weather_note_gap_min", 60)
+        gap_min = int(gap_min) if gap_min is not None else 60  # 0 合法：不限制间隔
+        last_note_ts = int(self.db.kv_get("last_daily_note_ts", 0) or 0)
+        if last_note_ts and (time.time() - last_note_ts) < gap_min * 60:
+            return None
         self.db.kv_set(key, f"{today}:{cnt + 1}")
+        self.db.kv_set("last_daily_note_ts", int(time.time()))
         note = self.daily_note_text(loc_name, wx)
         self.db.add_event(
             target_id=target_id,
