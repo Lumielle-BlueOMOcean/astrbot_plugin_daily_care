@@ -1,0 +1,16 @@
+# 运行时数据（不随插件发布）
+data/
+__pycache__/
+*.pyc
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 开发笔记 / 天使记忆（绝不发布）
+.angel/
+
+# 测试与临时
+tests/__pycache__/
+.DS_Store
+*.zip

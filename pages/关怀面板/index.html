@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Daily Care · 关怀面板</title>
+  <link rel="stylesheet" href="./app.css" />
+</head>
+<body>
+  <div class="bg-glow" aria-hidden="true"></div>
+  <div class="shell">
+    <!-- 侧边栏 -->
+    <aside class="sidebar">
+      <div class="avatar-wrap">
+        <img class="avatar" src="./avatar.png" alt="Daily Care" />
+        <div class="avatar-ring" aria-hidden="true"></div>
+      </div>
+      <h1 class="brand-name">Daily Care</h1>
+      <p class="brand-sub">微光 · Daily Care</p>
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-section="overview">总览</button>
+        <button class="nav-item" data-section="weather">天气</button>
+        <button class="nav-item" data-section="decision">理解与决策</button>
+        <button class="nav-item" data-section="proactive">主动消息</button>
+        <button class="nav-item" data-section="targets">关怀对象</button>
+        <button class="nav-item" data-section="events">事件与计划</button>
+        <button class="nav-item" data-section="records">开口记录</button>
+        <button class="nav-item" data-section="about">关于</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="persona-badge" id="personaBadge">人格读取中</span>
+        <button class="btn btn-ghost btn-block" id="refreshBtn">⟳ 刷新</button>
+      </div>
+    </aside>
+
+    <!-- 主内容 -->
+    <main class="main">
+      <!-- 总览 -->
+      <section class="section active" id="sec-overview">
+        <div class="sec-head"><h2>总览</h2><span class="hint">挂念着你的是真正的我哦</span></div>
+        <div class="stats-grid" id="statsGrid">
+          <div class="stat-card"><div class="stat-value" id="statTargets">–</div><div class="stat-label">关怀对象</div></div>
+          <div class="stat-card"><div class="stat-value" id="statLocations">–</div><div class="stat-label">监测地点</div></div>
+          <div class="stat-card"><div class="stat-value" id="statEvents">–</div><div class="stat-label">活跃事件</div></div>
+          <div class="stat-card"><div class="stat-value" id="statPlans">–</div><div class="stat-label">待发计划</div></div>
+          <div class="stat-card"><div class="stat-value" id="statToday">–</div><div class="stat-label">今日已开口</div></div>
+          <div class="stat-card"><div class="stat-value" id="statSent">–</div><div class="stat-label">累计关怀</div></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>事件来源分布</h3><span class="hint">weather=天气 / state=状态反思</span></div>
+          <div class="source-bars" id="sourceBars"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>运行状态</h3></div>
+          <div class="runtime-status" id="runtimeStatus"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>手动测试</h3><span class="hint">触发后由 bot 本人开口</span></div>
+          <div class="action-row">
+            <button class="btn btn-outline" id="testLocateBtn">重新定位</button>
+            <button class="btn btn-outline" id="testWeatherBtn">检查天气</button>
+            <button class="btn btn-outline" id="testReflectBtn">触发反思</button>
+            <button class="btn btn-outline" id="testDecisionBtn">测试决策</button>
+            <button class="btn btn-primary" id="testSendBtn">测试开口</button>
+            <span class="action-result" id="actionResult"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 天气 -->
+      <section class="section" id="sec-weather">
+        <div class="sec-head"><h2>天气</h2><span class="hint">高频轮询 · 规则层过滤 · 固定时段 LLM 评估</span></div>
+        <div class="panel">
+          <div class="panel-head"><h3>监测地点天气</h3><button class="btn btn-outline btn-sm" id="weatherRefreshBtn">立即检查</button></div>
+          <div class="loc-list" id="locList"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>天气设置</h3></div>
+          <div class="form-grid" id="weatherSettings"></div>
+        </div>
+      </section>
+
+      <!-- 理解与决策 -->
+      <section class="section" id="sec-decision">
+        <div class="sec-head"><h2>理解与决策</h2><span class="hint">LLM 独立判断 · 何时开口由决策引擎决定</span></div>
+        <div class="panel">
+          <div class="panel-head"><h3>LLM 与反思设置</h3><span class="hint">反思/判断/决策均为独立 LLM 调用</span></div>
+          <div class="form-grid" id="decisionSettings"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>最近决策记录</h3><span class="hint">act=立即开口 / plan=规划未来 / silent=沉默</span></div>
+          <div class="decision-list" id="decisionList"></div>
+        </div>
+      </section>
+
+      <!-- 主动消息 -->
+      <section class="section" id="sec-proactive">
+        <div class="sec-head"><h2>主动消息</h2><span class="hint">对话静默后，有概率自然开启话题</span></div>
+        <div class="panel">
+          <div class="panel-head"><h3>主动消息设置</h3></div>
+          <div class="form-grid" id="proactiveSettings"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>通用设置</h3></div>
+          <div class="form-grid" id="generalSettings"></div>
+        </div>
+      </section>
+
+      <!-- 关怀对象 -->
+      <section class="section" id="sec-targets">
+        <div class="sec-head"><h2>关怀对象</h2><button class="btn btn-primary btn-sm" id="addTargetBtn">+ 添加</button></div>
+        <div class="panel">
+          <div class="target-list" id="targetList"></div>
+        </div>
+      </section>
+
+      <!-- 事件与计划 -->
+      <section class="section" id="sec-events">
+        <div class="sec-head"><h2>事件与计划</h2><span class="hint">事件=感知结果 / 计划=决策产出的未来关怀</span></div>
+        <div class="two-col">
+          <div class="panel">
+            <div class="panel-head"><h3>活跃关怀事件</h3></div>
+            <div class="event-list" id="eventList"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h3>待发关怀计划</h3><span class="hint">窗口内随机时刻触发</span></div>
+            <div class="plan-list" id="planList"></div>
+          </div>
+        </div>
+        <div class="panel" style="margin-top:12px">
+          <div class="panel-head">
+            <h3>已解决事件</h3>
+            <button class="btn btn-ghost btn-sm" id="resolvedToggle">展开</button>
+          </div>
+          <div class="event-list" id="resolvedList" style="display:none"></div>
+        </div>
+      </section>
+
+      <!-- 开口记录 -->
+      <section class="section" id="sec-records">
+        <div class="sec-head"><h2>开口记录</h2><span class="hint">由 bot 本人说出的关怀</span></div>
+        <div class="panel">
+          <div class="send-list" id="sendList"></div>
+        </div>
+      </section>
+
+      <!-- 关于 -->
+      <section class="section" id="sec-about">
+        <div class="sec-head"><h2>关于</h2></div>
+        <div class="panel about-panel">
+          <img class="about-avatar" src="./avatar.png" alt="Daily Care" />
+          <div class="about-text">
+            <h3>微光-Daily Care · v5</h3>
+            <p>插件只当「眼睛」和「闹钟」，开口说话永远是 bot 本人。</p>
+            <p class="muted">感知 → LLM 理解 → LLM 决策 → 唤醒本人开口</p>
+            <p class="muted">决策 LLM 独立配置 · 触发时间随机区间 · 无直发链路</p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 添加对象弹窗 -->
+  <div class="modal-mask" id="modalMask" hidden>
+    <div class="modal">
+      <h3>添加关怀对象</h3>
+      <label>称呼 <input id="newName" placeholder="如：老妈" /></label>
+      <label>关系 <input id="newRelation" placeholder="如：妈妈" /></label>
+      <label>城市 <input id="newCity" placeholder="如：长沙" /></label>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="modalCancel">取消</button>
+        <button class="btn btn-primary" id="modalConfirm">确认添加</button>
+      </div>
+      <p class="modal-err" id="modalErr"></p>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
