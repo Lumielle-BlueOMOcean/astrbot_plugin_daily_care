@@ -91,7 +91,7 @@
   },
   "weather_tool_enabled": {
     "type": "bool",
-    "description": "注册天气查询工具（bot 本人在对话中可被问天气时自然调用）",
+    "description": "注册天气查询工具，对话中被问天气时自然调用",
     "hint": "对话中可查询天气",
     "default": true
   },
@@ -109,13 +109,13 @@
   },
   "daily_weather_note_window": {
     "type": "string",
-    "description": "常态天气提示倾向时段列表（JSON 数组，可多选预设窗口+自定义 HH:MM-HH:MM，如 [\"morning\",\"07:00-08:00\"]）",
+    "description": "常态提示倾向时段（JSON 数组，预设+自定义）",
     "hint": "常态提示倾向时段",
     "default": "[\"morning\"]"
   },
   "care_cooldown_minutes": {
     "type": "int",
-    "description": "状态/计划关怀的最小间隔（分钟）；主动消息与天气关怀冷却各自独立",
+    "description": "状态关怀最小间隔（分钟），三板块冷却独立",
     "hint": "状态关怀冷却",
     "default": 240
   },
@@ -163,7 +163,7 @@
   },
   "qweather_key": {
     "type": "string",
-    "description": "和风天气 API Key（可选，填了自动切换国内数据源）",
+    "description": "和风天气 API Key（可选，填了自动切换）",
     "hint": "和风天气Key（可选）",
     "default": ""
   },
