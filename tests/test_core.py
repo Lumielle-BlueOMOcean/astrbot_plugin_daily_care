@@ -709,8 +709,13 @@ def test_daily_note_flow():
     t_id = db.get_default_target()["id"]
     loc_id = db.upsert_location("重庆", 29.56, 106.55, "dynamic", "重庆")
 
+    # 勿扰判断依赖真实时钟，测试固定为非勿扰，避免时间敏感导致不稳定
+    def _no_dnd(self):
+        return False
+
     # 开关关闭：不生成
     mon = CareMonitor(db, {"enable_daily_weather_note": False, "dnd_start": "23:00", "dnd_end": "08:00"})
+    mon._in_dnd = _no_dnd.__get__(mon)
     wx = {"today": {"desc": "晴", "tmax": 31.0, "tmin": 24.0, "precip_prob": 10.0}}
     n1 = mon._try_daily_note(t_id, loc_id, "重庆", wx, "2026-08-16")
     assert n1 is None, "开关关闭不应生成"
@@ -718,6 +723,7 @@ def test_daily_note_flow():
     # 开关开启：生成
     mon = CareMonitor(db, {"enable_daily_weather_note": True, "daily_weather_note_limit": 1,
                            "dnd_start": "23:00", "dnd_end": "08:00"})
+    mon._in_dnd = _no_dnd.__get__(mon)
     n2 = mon._try_daily_note(t_id, loc_id, "重庆", wx, "2026-08-16")
     assert n2 is not None, "开关开启应生成"
     ev = db.get_active_events(t_id)
@@ -840,14 +846,20 @@ def test_decision_guarantee():
     if not (23 <= cur_h or cur_h < 8):
         assert r2["decision"] == "act", "保底+非勿扰时 plan 应转 act"
 
-    # 场景3：保底 + plan 到明天 + 全时段勿扰 → 收敛到今天窗口
+    # 场景3：保底 + plan 到明天 + 全时段勿扰 → 收敛到今天窗口（若今天已无窗口则转 act）
     cfg_dnd = dict(base_cfg); cfg_dnd["dnd_start"] = "00:00"; cfg_dnd["dnd_end"] = "23:59"
     eng3 = DecisionEngine(db, cfg_dnd, None)
     eng3.llm_func = asyncio.run(fake_llm('{"decision":"plan","background":"你最近身体不适","plan_date":"2026-08-17","trigger_window":"morning","reason":"勿扰中"}'))
     r3 = asyncio.run(eng3.decide(t, source="proactive", guarantee=True))
-    assert r3["decision"] == "plan", "勿扰中保底仍应开口（plan）"
-    assert r3["plan_date"] == _dt.now().strftime("%Y-%m-%d"), "勿扰中保底 plan 必须是今天"
-    assert r3["trigger_window"] in ("morning", "noon", "evening", "night"), "窗口应有效"
+    cur_h3 = _dt.now().hour
+    if cur_h3 < 23:
+        # 今天仍有剩余窗口：plan 必须收敛到今天，不推明天
+        assert r3["decision"] == "plan", "勿扰中保底仍应开口（plan）"
+        assert r3["plan_date"] == _dt.now().strftime("%Y-%m-%d"), "勿扰中保底 plan 必须是今天"
+        assert r3["trigger_window"] in ("morning", "noon", "evening", "night"), "窗口应有效"
+    else:
+        # 23 点后今天已无可用窗口：plan 被迫转 act（今天必须开口，语义正确）
+        assert r3["decision"] == "act", "勿扰且今天无窗口时保底应转 act"
 
     # 场景4：非保底 + silent → 保持 silent（不误伤正常决策）
     eng4 = DecisionEngine(db, base_cfg, None)

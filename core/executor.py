@@ -158,6 +158,15 @@ class Executor:
                 self.db.mark_plan(plan["id"], "skipped")
         return sent
 
+    @staticmethod
+    def _last_send_key(target_id: int, channel: str) -> str:
+        """冷却分轨的 kv 键：主动/天气/状态各自记录最后发送时间。"""
+        if channel == "proactive":
+            return f"last_proactive_send_{target_id}"
+        if channel in ("weather", "weather_alert"):
+            return f"last_weather_send_{target_id}"
+        return f"last_care_send_{target_id}"
+
     async def execute_immediate(self, background: str, channel: str = "care") -> bool:
         """决策为 act 时立即唤醒开口。channel 区分来源：主动消息传 proactive，关怀传 care。"""
         if self.in_dnd():
@@ -168,7 +177,8 @@ class Executor:
         ok, _ = await self._woke_for_care(target, background)
         if ok:
             self.db.add_send_log(target["id"], 0, background[:500], channel)
-            self.db.kv_set(f"last_care_send_{target['id']}", int(time.time()))
+            # 冷却分轨：按 channel 记录各自最后发送时间
+            self.db.kv_set(self._last_send_key(target["id"], channel), int(time.time()))
             return True
         logger.warning("[DailyCare] 立即开口唤醒失败，放弃本次（不降级直发）")
         return False

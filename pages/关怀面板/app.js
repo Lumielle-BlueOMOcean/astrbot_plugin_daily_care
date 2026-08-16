@@ -84,12 +84,16 @@ const FORM_META = {
     ["weather_cooldown_hours", "同类提醒冷却(小时)", "6", "同类天气提醒冷却"],
     ["qweather_key", "和风天气 Key(可选)", "", "和风天气Key（可选）"],
     ["enable_qweather_alerts", "启用和风预警窗口", true, "启用灾害预警"],
+    ["enable_daily_weather_note", "常态天气提示", false, "无特殊天气也每天问候一次天气"],
+    ["daily_weather_note_limit", "常态提示次数/天", "1", "每日常态天气提示次数上限"],
+    ["daily_weather_note_window", "常态提示时段", "morning", "倾向时段：morning/noon/evening"],
   ],
   decision: [
     ["weather_tool_enabled", "天气工具(对话中可用)", true, "对话中可查询天气"],
     ["decision_llm_id", "决策 LLM(可选)", "", "独立决策LLM；留空跟随会话"],
     ["decision_interval", "决策循环间隔(分钟)", "25", "决策循环间隔"],
     ["chat_reflect_interval", "状态反思间隔(分钟)", "60", "状态反思间隔"],
+    ["enable_chat_monitor", "启用对话状态反思", true, "从聊天记录提炼关怀信号"],
     ["care_level", "关怀积极度(1-10)", 5, "越高越愿意主动开口", "range"],
     ["care_daily_limit", "关怀消息每日上限(次)", "2", "每日关怀消息上限"],
     ["care_cooldown_minutes", "开口冷却(分钟)", "240", "两次开口最小间隔"],
@@ -102,12 +106,16 @@ const FORM_META = {
     ["probe_min_gap_min", "两次主动最小间隔(分钟)", "300", "两次主动最小间隔"],
     ["probe_interval", "主动检测间隔(分钟)", "10", "检测轮询间隔"],
   ],
-  general: [
+  global: [
     ["dnd_start", "勿扰开始", "23:00", "勿扰开始时间", "time"],
     ["dnd_end", "勿扰结束", "08:00", "勿扰结束时间", "time"],
     ["timezone", "时区", "Asia/Shanghai", "天气接口时区"],
-    ["target_user_id", "目标用户QQ", "", "关怀对象；留空则关怀所有用户"],
+    ["platform_id", "平台实例ID", "auto", "auto 自动解析；多实例时手动指定"],
+  ],
+  targets: [
+    ["target_user_id", "目标用户QQ", "", "默认关怀对象；留空则关怀所有用户"],
     ["target_group_id", "目标群号(可选)", "", "关怀群号；留空仅私聊"],
+    ["relation_cities", "关系人城市(JSON)", "[]", "JSON数组：[{'qq':'123','city':'重庆'}]"],
   ],
 };
 
@@ -183,7 +191,8 @@ function renderOverview(data) {
   buildForm("weatherSettings", FORM_META.weather, cfg);
   buildForm("decisionSettings", FORM_META.decision, cfg);
   buildForm("proactiveSettings", FORM_META.proactive, cfg);
-  buildForm("generalSettings", FORM_META.general, cfg);
+  buildForm("globalSettings", FORM_META.global, cfg);
+  buildForm("targetsSettings", FORM_META.targets, cfg);
   document.querySelectorAll('input[type="range"]').forEach((el) => {
     el.addEventListener("input", () => {
       const span = document.querySelector(`[data-range="${el.dataset.key}"]`);

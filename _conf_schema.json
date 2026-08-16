@@ -80,7 +80,7 @@
   "weather_cooldown_hours": {
     "type": "int",
     "description": "同类天气提醒冷却（小时）",
-    "hint": "同类天气提醒冷却",
+    "hint": "天气关怀冷却",
     "default": 6
   },
   "enable_qweather_alerts": {
@@ -115,8 +115,8 @@
   },
   "care_cooldown_minutes": {
     "type": "int",
-    "description": "两次主动关怀的最小间隔（分钟）",
-    "hint": "两次开口最小间隔",
+    "description": "状态/计划关怀的最小间隔（分钟）；主动消息与天气关怀冷却各自独立",
+    "hint": "状态关怀冷却",
     "default": 240
   },
   "enable_proactive": {
@@ -146,7 +146,7 @@
   "probe_min_gap_min": {
     "type": "int",
     "description": "两次主动消息最小间隔（分钟）",
-    "hint": "两次主动最小间隔",
+    "hint": "主动消息冷却",
     "default": 300
   },
   "probe_interval": {

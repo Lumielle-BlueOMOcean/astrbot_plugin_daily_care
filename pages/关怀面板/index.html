@@ -22,6 +22,7 @@
         <button class="nav-item" data-section="weather">天气</button>
         <button class="nav-item" data-section="decision">理解与决策</button>
         <button class="nav-item" data-section="proactive">主动消息</button>
+        <button class="nav-item" data-section="global">全局</button>
         <button class="nav-item" data-section="targets">关怀对象</button>
         <button class="nav-item" data-section="events">事件与计划</button>
         <button class="nav-item" data-section="records">开口记录</button>
@@ -100,9 +101,14 @@
           <div class="panel-head"><h3>主动消息设置</h3></div>
           <div class="form-grid" id="proactiveSettings"></div>
         </div>
+      </section>
+
+      <!-- 全局 -->
+      <section class="section" id="sec-global">
+        <div class="sec-head"><h2>全局</h2><span class="hint">所有板块共用的总管配置</span></div>
         <div class="panel">
-          <div class="panel-head"><h3>通用设置</h3></div>
-          <div class="form-grid" id="generalSettings"></div>
+          <div class="panel-head"><h3>勿扰时段与时区</h3></div>
+          <div class="form-grid" id="globalSettings"></div>
         </div>
       </section>
 
@@ -110,6 +116,11 @@
       <section class="section" id="sec-targets">
         <div class="sec-head"><h2>关怀对象</h2><button class="btn btn-primary btn-sm" id="addTargetBtn">+ 添加</button></div>
         <div class="panel">
+          <div class="panel-head"><h3>默认关怀对象</h3></div>
+          <div class="form-grid" id="targetsSettings"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>对象列表</h3></div>
           <div class="target-list" id="targetList"></div>
         </div>
       </section>

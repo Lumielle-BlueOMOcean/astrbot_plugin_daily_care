@@ -36,7 +36,7 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 
-@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "v1.00")
+@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.0.0")
 class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -315,8 +315,9 @@ class DailyCarePlugin(Star):
             if guarantee:
                 logger.warning("[DailyCare] 保底触发但决策 LLM 失败，按 act 兜底")
                 bg = "我们有一阵子没说话了，有点惦记你"
-                cooldown_min = int(self._cfg("care_cooldown_minutes", 240))
-                last = self.db.kv_get(f"last_care_send_{target['id']}", 0)
+                # 保底兜底属于主动消息：用主动板块冷却 probe_min_gap_min
+                cooldown_min = int(self._cfg("probe_min_gap_min", 300))
+                last = self.db.kv_get(f"last_proactive_send_{target['id']}", 0)
                 if (time.time() - last) >= cooldown_min * 60:
                     ok = await self._executor.execute_immediate(bg, channel="proactive")
                     if ok:
@@ -328,20 +329,27 @@ class DailyCarePlugin(Star):
         if decision == "act":
             bg = result.get("background") or ""
             if bg:
-                # 执行端冷却保护（防决策循环连续 act）
-                cooldown_min = int(self._cfg("care_cooldown_minutes", 240))
-                last = self.db.kv_get(f"last_care_send_{target['id']}", 0)
-                if (time.time() - last) < cooldown_min * 60:
-                    logger.info("[DailyCare] act 决策被冷却拦截（距上次开口过近）")
-                    return "act_cooled"
-                # v1.00：消息分轨计数——weather 天气 / care 状态·计划 / proactive 主动
+                # v1.00：冷却分轨——主动/天气/状态各自独立冷却，互不挤占
+                # 主动消息 → probe_min_gap_min（主动板块自管）
+                # 天气关怀 → weather_cooldown_hours（同类天气不重复）
+                # 状态/计划关怀 → care_cooldown_minutes（状态板块自管）
                 cat = result.get("category", "state")
                 if source == "proactive":
                     channel = "proactive"
+                    cooldown_min = int(self._cfg("probe_min_gap_min", 300))
+                    last_key = f"last_proactive_send_{target['id']}"
                 elif cat == "weather":
                     channel = "weather"
+                    cooldown_min = int(self._cfg("weather_cooldown_hours", 6)) * 60
+                    last_key = f"last_weather_send_{target['id']}"
                 else:
                     channel = "care"
+                    cooldown_min = int(self._cfg("care_cooldown_minutes", 240))
+                    last_key = f"last_care_send_{target['id']}"
+                last = self.db.kv_get(last_key, 0)
+                if (time.time() - last) < cooldown_min * 60:
+                    logger.info(f"[DailyCare] {channel} 决策被冷却拦截（距上次{channel}开口过近）")
+                    return "act_cooled"
                 ok = await self._executor.execute_immediate(bg, channel=channel)
                 if ok:
                     logger.info(f"[DailyCare] 已按决策立即开口: {bg[:40]}...")
