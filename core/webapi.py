@@ -12,7 +12,10 @@ from astrbot.api import logger
 PLUGIN_NAME = "astrbot_plugin_daily_care"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
 
-# 允许通过 WebUI 修改的配置白名单（v2）
+# 允许通过 WebUI 修改的配置白名单（v2 + v1.1.2 补齐）
+# v1.1.2：修复「天气相关配置保存后变回默认」——常态天气提示四件套
+# （enable_daily_weather_note/limit/window/gap_min）与 platform_id 此前
+# 只在 overview 返回、可显示可修改，但不在白名单内，保存时被静默过滤。
 SETTABLE_KEYS = {
     "care_level", "care_daily_limit", "enable_chat_monitor", "chat_reflect_interval",
     "dnd_start", "dnd_end", "weather_check_interval", "enable_weather_judge",
@@ -22,6 +25,9 @@ SETTABLE_KEYS = {
     "probe_daily_limit", "probe_interval",
     "relation_cities", "timezone", "target_user_id",
     "target_group_id", "qweather_key",
+    "enable_daily_weather_note", "daily_weather_note_limit",
+    "daily_weather_note_window", "daily_weather_note_gap_min",
+    "platform_id",
 }
 
 
