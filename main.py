@@ -36,7 +36,7 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 
-@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.2.0")
+@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.1")
 class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -315,7 +315,7 @@ class DailyCarePlugin(Star):
             if guarantee:
                 logger.warning("[DailyCare] 保底触发但决策 LLM 失败，按 act 兜底")
                 bg = "我们有一阵子没说话了，有点惦记你"
-                # v1.2.0：保底兜底直接开口。开口成功会重置静默基准
+                # v1.1.1：保底兜底直接开口。开口成功会重置静默基准
                 # （last_activity_ts），静默需重新攒够 min_silence 才有下一轮
                 # 资格，间隔由静默语义承载，无需单独冷却。
                 ok = await self._executor.execute_immediate(bg, channel="proactive")
@@ -328,7 +328,7 @@ class DailyCarePlugin(Star):
         if decision == "act":
             bg = result.get("background") or ""
             if bg:
-                # v1.00 冷却分轨 + v1.2.0 修订：
+                # v1.00 冷却分轨 + v1.1.1 修订：
                 # - 主动消息（source=proactive）不再需要独立冷却——进入前静默
                 #   已满足 min_silence，且开口成功会重置静默基准，两次主动的
                 #   间隔由静默语义承载（旧 probe_min_gap_min 已删除）

@@ -883,7 +883,7 @@ def test_city_switch_invalidate():
 
 
 def test_silence_reset():
-    """v1.2.0：静默以「任何一方交流」为基准——用户发言或 bot 开口都重置静默；
+    """v1.1.1：静默以「任何一方交流」为基准——用户发言或 bot 开口都重置静默；
     删除「两次主动最小间隔」后，间隔由最小静默承载，should_probe 不再接收
     min_gap/last_probe。"""
     from core.monitor import CareMonitor

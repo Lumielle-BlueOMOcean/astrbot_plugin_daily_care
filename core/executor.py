@@ -150,7 +150,7 @@ class Executor:
                 # 记录发送日志（以背景代表"提醒过这件事"，供防重复）
                 self.db.add_send_log(target["id"], plan["id"], background[:500], "care")
                 self.db.kv_set(f"last_care_send_{target['id']}", int(time.time()))
-                self.db.kv_set("last_activity_ts", int(time.time()))  # v1.2.0：主动开口也算交流，重置静默
+                self.db.kv_set("last_activity_ts", int(time.time()))  # v1.1.1：主动开口也算交流，重置静默
                 sent.append(background)
                 logger.info(f"[DailyCare] 计划已执行（随机时刻 {datetime.fromtimestamp(trigger_ts).strftime('%H:%M') if trigger_ts else '窗口' }）")
             else:
@@ -180,7 +180,7 @@ class Executor:
             self.db.add_send_log(target["id"], 0, background[:500], channel)
             # 冷却分轨：按 channel 记录各自最后发送时间
             self.db.kv_set(self._last_send_key(target["id"], channel), int(time.time()))
-            self.db.kv_set("last_activity_ts", int(time.time()))  # v1.2.0：主动开口也算交流，重置静默
+            self.db.kv_set("last_activity_ts", int(time.time()))  # v1.1.1：主动开口也算交流，重置静默
             return True
         logger.warning("[DailyCare] 立即开口唤醒失败，放弃本次（不降级直发）")
         return False
@@ -222,7 +222,7 @@ class Executor:
         if ok:
             self.db.add_send_log(target["id"], 0, background[:500], "test")
             self.db.kv_set(f"last_care_send_{target['id']}", int(time.time()))
-            self.db.kv_set("last_activity_ts", int(time.time()))  # v1.2.0：主动开口也算交流，重置静默
+            self.db.kv_set("last_activity_ts", int(time.time()))  # v1.1.1：主动开口也算交流，重置静默
             return [background]
         return []
 
