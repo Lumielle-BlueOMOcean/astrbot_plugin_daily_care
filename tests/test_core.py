@@ -913,6 +913,33 @@ def test_silence_reset():
     print("✓ 静默重置（双方交流）测试通过")
 
 
+def test_settable_keys_cover_schema():
+    """v1.1.2 防回归：SETTABLE_KEYS 保存白名单必须覆盖全部 schema 配置项。
+
+    历史教训：常态天气提示四件套 + platform_id 只在 overview 返回（前端能
+    显示能改），但不在 SETTABLE_KEYS 内，保存时被 update_settings 静默过滤，
+    导致「天气配置保存后变回默认」。本测试锁死：schema 里出现的每个配置项
+    都必须能被 WebUI 保存，防止同类问题再犯。
+    """
+    from core.webapi import SETTABLE_KEYS
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    schema = json.load(open(os.path.join(base_dir, "_conf_schema.json")))
+    schema_keys = set()
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if isinstance(v, dict) and ("type" in v or "default" in v):
+                    schema_keys.add(k)
+                else:
+                    walk(v)
+
+    walk(schema)
+    missing = sorted(schema_keys - SETTABLE_KEYS)
+    assert not missing, f"schema 有但 SETTABLE_KEYS 无（保存会被静默丢弃）: {missing}"
+    print(f"✓ SETTABLE_KEYS 覆盖全部 schema 配置项（{len(schema_keys)}/{len(SETTABLE_KEYS)}）测试通过")
+
+
 def test_decision_guarantee():
     """最长静默保底：决策层硬约束（v5.6.0）"""
     from core.decision import DecisionEngine
@@ -1001,6 +1028,7 @@ if __name__ == "__main__":
     test_weather_lifecycle()
     test_city_switch_invalidate()
     test_silence_reset()
+    test_settable_keys_cover_schema()
     test_decision_guarantee()
     test_reflect_incremental()
     print("\n全部测试通过 ✓")
