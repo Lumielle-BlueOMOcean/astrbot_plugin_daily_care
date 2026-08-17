@@ -104,7 +104,6 @@ const FORM_META = {
     ["probe_min_silence_min", "最小静默(分钟)", "180", "静默多久才有资格主动"],
     ["probe_max_silence_min", "最长等待(分钟)", "600", "最多等多久必开口一次"],
     ["probe_daily_limit", "每日主动上限(次)", "2", "每日主动消息上限"],
-    ["probe_min_gap_min", "两次主动最小间隔(分钟)", "300", "两次主动最小间隔"],
     ["probe_interval", "主动检测间隔(分钟)", "10", "检测轮询间隔"],
   ],
   global: [

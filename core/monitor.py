@@ -360,19 +360,25 @@ class CareMonitor:
 
     # ---------- 冷场感知 ----------
     def record_user_message(self, ts: Optional[int] = None) -> None:
-        """记录用户最后发言时间（由 main 的消息入口调用）。"""
-        self.db.kv_set("last_user_msg_ts", int(ts or time.time()))
+        """记录用户最后发言时间（由 main 的消息入口调用）。
+
+        v1.2.0：静默基准改为「任何一方交流」——用户发言同时更新
+        last_activity_ts，bot 主动开口成功也会更新它（见 executor）。
+        last_user_msg_ts 保留，供决策 prompt 展示「用户静默时长」。
+        """
+        now = int(ts or time.time())
+        self.db.kv_set("last_user_msg_ts", now)
+        self.db.kv_set("last_activity_ts", now)
 
     def silence_minutes(self) -> int:
-        """当前已静默的分钟数。"""
-        last = self.db.kv_get("last_user_msg_ts", 0)
+        """当前已静默的分钟数（以最后任何一方交流为基准）。"""
+        last = self.db.kv_get("last_activity_ts", 0)
         if not last:
             return 0
         return max(0, int((time.time() - last) / 60))
 
     def should_probe(self, min_silence: int, max_silence: int,
-                     daily_limit: int, min_gap: int, today_count: int,
-                     last_probe: int) -> str:
+                     daily_limit: int, today_count: int) -> str:
         """冷场主动消息的触发判定（随机概率 + 保底边界）。
 
         返回触发类型：
@@ -381,18 +387,20 @@ class CareMonitor:
         - "prob"：min~max 之间概率触发（15% 平滑上升到接近 100%）
         - ""：不触发
 
-        语义（v5.4.1）：静默小于 min_silence 不打扰；达到 max_silence 保底触发，
-        保证不会让人等超过 max_silence 还没有主动消息；min~max 之间概率从
-        15% 平滑上升到接近 100%，静默越久越应该被关心。每日上限、最小间隔
-        约束保留（防刷屏，与「最长等待窗口」语义不冲突）。
+        语义（v5.4.1 / v1.2.0）：静默小于 min_silence 不打扰；达到 max_silence
+        保底触发，保证不会让人等超过 max_silence 还没有主动消息；min~max 之间
+        概率从 15% 平滑上升到接近 100%，静默越久越应该被关心。
+
+        v1.2.0：删除「两次主动最小间隔」配置。由于静默以任何一方交流为基准
+        （bot 开口成功也会重置静默），发完一条主动消息后静默归零，必须重新
+        攒够 min_silence 才有下一轮资格——间隔语义已由 min_silence 完全承载，
+        无需单独的 min_gap；每日上限保留作最终防线。
         """
         import random as _r
         silence = self.silence_minutes()
         if silence < min_silence:
             return ""
         if today_count >= daily_limit:
-            return ""
-        if time.time() - last_probe < min_gap * 60:
             return ""
         # 达到最大静默：保底触发（最长等待窗口的保证线）
         if silence >= max_silence:

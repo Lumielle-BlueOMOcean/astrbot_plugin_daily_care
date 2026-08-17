@@ -882,6 +882,36 @@ def test_city_switch_invalidate():
     print("✓ 城市切换旧天气失效测试通过")
 
 
+def test_silence_reset():
+    """v1.2.0：静默以「任何一方交流」为基准——用户发言或 bot 开口都重置静默；
+    删除「两次主动最小间隔」后，间隔由最小静默承载，should_probe 不再接收
+    min_gap/last_probe。"""
+    from core.monitor import CareMonitor
+    db = make_db()
+    mon = CareMonitor(db, {})
+    # 初始无基准 → 静默 0
+    assert mon.silence_minutes() == 0, "无基准时应为 0"
+    # 100 分钟前最后交流 → 静默 100
+    db.kv_set("last_activity_ts", int(time.time()) - 6000)
+    assert mon.silence_minutes() == 100, mon.silence_minutes()
+    # 用户再次发言 → 双写，静默归零
+    mon.record_user_message()
+    assert mon.silence_minutes() == 0, "用户发言应重置静默"
+    # 模拟 bot 开口成功（executor 会写 last_activity_ts）→ 静默也归零
+    db.kv_set("last_activity_ts", int(time.time()) - 3600)
+    assert mon.silence_minutes() == 60
+    db.kv_set("last_activity_ts", int(time.time()))
+    assert mon.silence_minutes() == 0, "bot 开口应重置静默"
+    # should_probe 新签名：静默超 max → 保底；静默不足 min → 不触发
+    db.kv_set("last_activity_ts", int(time.time()) - 24000)  # 400 分钟，超 max_silence
+    assert mon.should_probe(10, 240, 10, 0) == "guarantee"
+    db.kv_set("last_activity_ts", int(time.time()))
+    assert mon.should_probe(10, 240, 10, 0) == ""
+    # 每日上限拦截优先
+    db.kv_set("last_activity_ts", int(time.time()) - 24000)
+    assert mon.should_probe(10, 240, 0, 0) == ""
+    print("✓ 静默重置（双方交流）测试通过")
+
 
 def test_decision_guarantee():
     """最长静默保底：决策层硬约束（v5.6.0）"""
@@ -970,6 +1000,7 @@ if __name__ == "__main__":
     test_daily_note_flow()
     test_weather_lifecycle()
     test_city_switch_invalidate()
+    test_silence_reset()
     test_decision_guarantee()
     test_reflect_incremental()
     print("\n全部测试通过 ✓")

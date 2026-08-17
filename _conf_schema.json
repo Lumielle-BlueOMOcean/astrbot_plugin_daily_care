@@ -143,12 +143,6 @@
     "hint": "每日主动消息上限",
     "default": 2
   },
-  "probe_min_gap_min": {
-    "type": "int",
-    "description": "两次主动消息最小间隔（分钟）",
-    "hint": "主动消息冷却",
-    "default": 300
-  },
   "probe_interval": {
     "type": "float",
     "description": "主动消息检测间隔（分钟）",

@@ -19,7 +19,7 @@ SETTABLE_KEYS = {
     "weather_cooldown_hours", "care_cooldown_minutes", "decision_interval",
     "enable_qweather_alerts", "weather_tool_enabled", "decision_llm_id",
     "enable_proactive", "probe_min_silence_min", "probe_max_silence_min",
-    "probe_daily_limit", "probe_min_gap_min", "probe_interval",
+    "probe_daily_limit", "probe_interval",
     "relation_cities", "timezone", "target_user_id",
     "target_group_id", "qweather_key",
 }
@@ -122,7 +122,6 @@ class CareWebAPI:
                 "probe_min_silence_min": self._cfg("probe_min_silence_min", 180),
                 "probe_max_silence_min": self._cfg("probe_max_silence_min", 600),
                 "probe_daily_limit": self._cfg("probe_daily_limit", 2),
-                "probe_min_gap_min": self._cfg("probe_min_gap_min", 300),
                 "probe_interval": self._cfg("probe_interval", 10),
                 "timezone": self._cfg("timezone", "Asia/Shanghai"),
                 "target_user_id": self._cfg("target_user_id", ""),

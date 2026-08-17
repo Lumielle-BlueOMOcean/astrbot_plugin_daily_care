@@ -36,7 +36,7 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 
-@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.0")
+@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.2.0")
 class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -315,41 +315,43 @@ class DailyCarePlugin(Star):
             if guarantee:
                 logger.warning("[DailyCare] 保底触发但决策 LLM 失败，按 act 兜底")
                 bg = "我们有一阵子没说话了，有点惦记你"
-                # 保底兜底属于主动消息：用主动板块冷却 probe_min_gap_min
-                cooldown_min = int(self._cfg("probe_min_gap_min", 300))
-                last = self.db.kv_get(f"last_proactive_send_{target['id']}", 0)
-                if (time.time() - last) >= cooldown_min * 60:
-                    ok = await self._executor.execute_immediate(bg, channel="proactive")
-                    if ok:
-                        logger.info("[DailyCare] 保底兜底已开口")
-                        return "act"
+                # v1.2.0：保底兜底直接开口。开口成功会重置静默基准
+                # （last_activity_ts），静默需重新攒够 min_silence 才有下一轮
+                # 资格，间隔由静默语义承载，无需单独冷却。
+                ok = await self._executor.execute_immediate(bg, channel="proactive")
+                if ok:
+                    logger.info("[DailyCare] 保底兜底已开口")
+                    return "act"
                 return "act_blocked"
             return "silent"
         decision = result.get("decision")
         if decision == "act":
             bg = result.get("background") or ""
             if bg:
-                # v1.00：冷却分轨——主动/天气/状态各自独立冷却，互不挤占
-                # 主动消息 → probe_min_gap_min（主动板块自管）
-                # 天气关怀 → weather_cooldown_hours（同类天气不重复）
-                # 状态/计划关怀 → care_cooldown_minutes（状态板块自管）
+                # v1.00 冷却分轨 + v1.2.0 修订：
+                # - 主动消息（source=proactive）不再需要独立冷却——进入前静默
+                #   已满足 min_silence，且开口成功会重置静默基准，两次主动的
+                #   间隔由静默语义承载（旧 probe_min_gap_min 已删除）
+                # - 天气关怀 → weather_cooldown_hours（同类天气不重复）
+                # - 状态/计划关怀 → care_cooldown_minutes（状态板块自管）
                 cat = result.get("category", "state")
-                if source == "proactive":
-                    channel = "proactive"
-                    cooldown_min = int(self._cfg("probe_min_gap_min", 300))
-                    last_key = f"last_proactive_send_{target['id']}"
-                elif cat == "weather":
+                if cat == "weather":
                     channel = "weather"
                     cooldown_min = int(self._cfg("weather_cooldown_hours", 6)) * 60
                     last_key = f"last_weather_send_{target['id']}"
+                elif source == "proactive":
+                    channel = "proactive"
+                    cooldown_min = 0
+                    last_key = ""
                 else:
                     channel = "care"
                     cooldown_min = int(self._cfg("care_cooldown_minutes", 240))
                     last_key = f"last_care_send_{target['id']}"
-                last = self.db.kv_get(last_key, 0)
-                if (time.time() - last) < cooldown_min * 60:
-                    logger.info(f"[DailyCare] {channel} 决策被冷却拦截（距上次{channel}开口过近）")
-                    return "act_cooled"
+                if last_key:
+                    last = self.db.kv_get(last_key, 0)
+                    if (time.time() - last) < cooldown_min * 60:
+                        logger.info(f"[DailyCare] {channel} 决策被冷却拦截（距上次{channel}开口过近）")
+                        return "act_cooled"
                 ok = await self._executor.execute_immediate(bg, channel=channel)
                 if ok:
                     logger.info(f"[DailyCare] 已按决策立即开口: {bg[:40]}...")
@@ -386,17 +388,13 @@ class DailyCarePlugin(Star):
                 min_silence = int(self._cfg("probe_min_silence_min", 180))
                 max_silence = int(self._cfg("probe_max_silence_min", 600))
                 daily_limit = int(self._cfg("probe_daily_limit", 2))
-                min_gap = int(self._cfg("probe_min_gap_min", 300))
                 today = datetime.now().strftime("%Y-%m-%d")
                 today_count = self.db.count_send_today(target["id"], today, "proactive")
-                last_probe = self.db.kv_get("last_probe_ts", 0)
                 trigger = self.monitor.should_probe(
-                    min_silence, max_silence, daily_limit, min_gap,
-                    today_count, last_probe,
+                    min_silence, max_silence, daily_limit, today_count,
                 )
                 if not trigger:
                     continue
-                self.db.kv_set("last_probe_ts", int(time.time()))
                 guarantee = trigger == "guarantee"
                 logger.info(
                     "[DailyCare] 冷场主动时机命中"
