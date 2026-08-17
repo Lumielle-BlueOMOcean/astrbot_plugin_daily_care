@@ -79,6 +79,7 @@ document.querySelectorAll(".nav-item").forEach((btn) => {
 // ---------- 设置表单 ----------
 const FORM_META = {
   weather: [
+    ["weather_tool_enabled", "天气工具(对话中可用)", true, "对话中可查询天气"],
     ["weather_check_interval", "天气轮询间隔(分钟)", "30", "天气轮询间隔"],
     ["enable_weather_judge", "启用天气 LLM 判断", true, "启用天气LLM判断"],
     ["weather_cooldown_hours", "同类提醒冷却(小时)", "6", "同类天气提醒冷却"],
@@ -90,11 +91,12 @@ const FORM_META = {
     ["daily_weather_note_window", "常态提示时段", '["morning"]', "可多选预设时段，也可自定义 HH:MM-HH:MM", "window-multi"],
   ],
   decision: [
-    ["weather_tool_enabled", "天气工具(对话中可用)", true, "对话中可查询天气"],
     ["decision_llm_id", "决策 LLM(可选)", "", "独立决策LLM；留空跟随会话"],
     ["decision_interval", "决策循环间隔(分钟)", "25", "决策循环间隔"],
-    ["chat_reflect_interval", "状态反思间隔(分钟)", "60", "状态反思间隔"],
+  ],
+  state: [
     ["enable_chat_monitor", "启用对话状态反思", true, "从聊天记录提炼关怀信号"],
+    ["chat_reflect_interval", "状态反思间隔(分钟)", "60", "状态反思间隔"],
     ["care_level", "关怀积极度(1-10)", 5, "越高越愿意主动开口", "range"],
     ["care_daily_limit", "关怀消息每日上限(次)", "2", "每日关怀消息上限"],
     ["care_cooldown_minutes", "开口冷却(分钟)", "240", "两次开口最小间隔"],
@@ -399,11 +401,15 @@ function windowLabel(w) {
 }
 
 function setText(id, v) {
-  document.getElementById(id).textContent = v ?? "–";
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = v ?? "–";
+  return el;
 }
 
 // ---------- 加载 ----------
 async function load() {
+  const badge = document.getElementById("personaBadge");
   try {
     const data = await api(API.overview);
     if (data.code !== 0) throw new Error(data.message);
@@ -412,11 +418,15 @@ async function load() {
     const cfg = ov.config || {};
     buildForm("weatherSettings", FORM_META.weather, cfg);
     buildForm("decisionSettings", FORM_META.decision, cfg);
+    buildForm("stateSettings", FORM_META.state, cfg);
     buildForm("proactiveSettings", FORM_META.proactive, cfg);
-    buildForm("generalSettings", FORM_META.general, cfg);
+    buildForm("globalSettings", FORM_META.global, cfg);
+    badge.classList.remove("error");
+    setText("personaBadge", "已连接");
   } catch (e) {
     console.error("overview 失败", e);
-    setText("personaBadge", "加载失败");
+    badge.classList.add("error");
+    setText("personaBadge", "加载失败：" + (e?.message || e));
   }
   try { renderTargets((await api(API.targets)).data || []); } catch (e) {}
   try { renderEvents((await api(API.events)).data || []); } catch (e) {}

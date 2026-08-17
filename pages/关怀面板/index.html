@@ -20,7 +20,8 @@
       <nav class="nav" id="nav">
         <button class="nav-item active" data-section="overview">总览</button>
         <button class="nav-item" data-section="weather">天气</button>
-        <button class="nav-item" data-section="decision">理解与决策</button>
+        <button class="nav-item" data-section="decision">决策引擎</button>
+        <button class="nav-item" data-section="state">状态与计划关怀</button>
         <button class="nav-item" data-section="proactive">主动消息</button>
         <button class="nav-item" data-section="global">全局</button>
         <button class="nav-item" data-section="targets">关怀对象</button>
@@ -81,16 +82,25 @@
         </div>
       </section>
 
-      <!-- 理解与决策 -->
+      <!-- 决策引擎 -->
       <section class="section" id="sec-decision">
-        <div class="sec-head"><h2>理解与决策</h2><span class="hint">LLM 独立判断 · 何时开口由决策引擎决定</span></div>
+        <div class="sec-head"><h2>决策引擎</h2><span class="hint">三类主动消息的最终裁决 · act/plan/silent</span></div>
         <div class="panel">
-          <div class="panel-head"><h3>LLM 与反思设置</h3><span class="hint">反思/判断/决策均为独立 LLM 调用</span></div>
+          <div class="panel-head"><h3>决策引擎设置</h3><span class="hint">全局生效：主动 / 天气 / 状态关怀均由此裁决</span></div>
           <div class="form-grid" id="decisionSettings"></div>
         </div>
         <div class="panel">
           <div class="panel-head"><h3>最近决策记录</h3><span class="hint">act=立即开口 / plan=规划未来 / silent=沉默</span></div>
           <div class="decision-list" id="decisionList"></div>
+        </div>
+      </section>
+
+      <!-- 状态与计划关怀 -->
+      <section class="section" id="sec-state">
+        <div class="sec-head"><h2>状态与计划关怀</h2><span class="hint">LLM 反思对话提炼状态 · 计划在合适时段开口</span></div>
+        <div class="panel">
+          <div class="panel-head"><h3>状态理解与关怀设置</h3><span class="hint">从聊天记录提炼关怀信号，决定开口节奏</span></div>
+          <div class="form-grid" id="stateSettings"></div>
         </div>
       </section>
 

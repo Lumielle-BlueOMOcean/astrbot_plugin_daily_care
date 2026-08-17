@@ -76,6 +76,10 @@ body {
   border-radius: 20px; background: rgba(67, 160, 71, 0.10); color: var(--ok);
   border: 1px solid rgba(67, 160, 71, 0.22);
 }
+.persona-badge.error {
+  background: rgba(229, 115, 115, 0.10); color: var(--danger);
+  border: 1px solid rgba(229, 115, 115, 0.28);
+}
 
 /* ---------- 主区 ---------- */
 .main { flex: 1; padding: 28px 32px 60px; max-width: 1080px; }
