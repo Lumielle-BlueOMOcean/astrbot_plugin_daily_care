@@ -47,8 +47,7 @@ python3 tests/test_core.py
 
 ## 发布约定
 
-- 发布版本号统一 v1.00（metadata + @register + README 三处一致），不随小功能迭代升号。
-- README 只放用户功能说明，更新日志/技术调整一律归档到内部开发日志，不进 README。
+- 发布版本号采用语义化版本（metadata + @register 两处一致）：bug 修复升补丁位（如 1.1.2 → 1.1.3），新功能升次版本位。README 只放用户功能说明，更新日志/技术调整一律归档到内部开发日志，不进 README。
 - 发布前五查：编译 / 测试全绿 / schema 对齐 / hint ≤25字 / 个性化残留零。
 - 每次发布生成纯净安装包（不含 data/、备份、__pycache__），删除旧包，替换新包。
 - 许可证：MIT。
