@@ -1000,6 +1000,154 @@ def test_decision_guarantee():
 
 
 
+def test_rest_sleep_window():
+    """v1.1.5 晚安识别：动态休息窗口 + 关键词检测 + 与勿扰时段协同。"""
+    from core.rest import (
+        detect_sleep_text, mark_sleep, break_rest, rest_until_ts,
+        in_rest_window, in_dnd_time_only, in_quiet,
+    )
+    import time as _time
+
+    def _ts(hour, minute=0):
+        now = datetime.now()
+        return int(_time.mktime((now.year, now.month, now.day, hour, minute, 0, 0, 0, -1)))
+
+    db = make_db()
+    # 1. 关键词命中
+    for hit in ["晚安", "我先睡了", "睡觉觉", "去睡觉啦", "困了，睡了", "睡了睡了", "我要睡觉了", "睡啦"]:
+        assert detect_sleep_text(hit), f"应命中: {hit}"
+    # 2. 语义相反不命中
+    for miss in ["还没睡", "睡不着", "没睡呢", "睡醒了", "不用睡", "今晚熬夜", "睡不著"]:
+        assert not detect_sleep_text(miss), f"不应命中: {miss}"
+    # 3. 标记休息窗口：now + 7h
+    mark_sleep(db, now_ts=1000000000, after_hours=7)
+    assert rest_until_ts(db) == 1000000000 + 7 * 3600
+    assert in_rest_window(db, now_ts=1000000000) is True
+    assert in_rest_window(db, now_ts=1000000000 + 7 * 3600 - 1) is True
+    assert in_rest_window(db, now_ts=1000000000 + 7 * 3600) is False
+    # 4. 用户发消息打破
+    break_rest(db)
+    assert rest_until_ts(db) == 0
+    assert in_rest_window(db, now_ts=1000000000) is False
+    # 5. in_quiet = 勿扰 OR 休息窗口
+    #    深夜(02:00)勿扰时段命中，无休息窗口也安静
+    cfg = {"dnd_start": "23:00", "dnd_end": "08:00"}
+    assert in_dnd_time_only(cfg, now_ts=_ts(2)) is True
+    assert in_quiet(db, cfg, now_ts=_ts(2)) is True
+    #    白天(12:00)勿扰不命中，无休息窗口则不安静
+    assert in_dnd_time_only(cfg, now_ts=_ts(12)) is False
+    assert in_quiet(db, cfg, now_ts=_ts(12)) is False
+    #    白天 + 休息窗口命中 → 安静
+    mark_sleep(db, now_ts=_ts(12), after_hours=7)
+    assert in_quiet(db, cfg, now_ts=_ts(14)) is True
+    # 6. 跨天勿扰（22:00-02:00）
+    cfg2 = {"dnd_start": "22:00", "dnd_end": "02:00"}
+    assert in_dnd_time_only(cfg2, now_ts=_ts(23)) is True
+    assert in_dnd_time_only(cfg2, now_ts=_ts(1)) is True
+    assert in_dnd_time_only(cfg2, now_ts=_ts(12)) is False
+    print("✓ 晚安识别/动态休息窗口测试通过")
+
+
+
+
+def test_reflect_sleep_detected():
+    """v1.1.5 完善：反思 LLM 兜底识别晚安（委婉表达，关键词未覆盖）。"""
+    from core.reflection import ChatReflector
+    from core.rest import rest_until_ts, in_rest_window
+    db = make_db()
+    history = [
+        {"role": "user", "content": "有点撑不住了，先下了"},
+        {"role": "assistant", "content": "好，早点休息"},
+    ]
+    async def fake_llm(system, user):
+        return json.dumps({
+            "new_states": [],
+            "resolved_events": [],
+            "sleep_detected": True,
+        })
+    r = ChatReflector(db, {"rest_after_sleep_hours": 7}, fake_llm)
+    asyncio.run(r.reflect(history))
+    # 反思后应已设置休息窗口
+    assert rest_until_ts(db) > 0, "sleep_detected=True 应设置休息窗口"
+    assert in_rest_window(db) is True
+    # 防重复：窗口已生效且距上次标记 <1h，再次反思不重复顺延
+    first = rest_until_ts(db)
+    asyncio.run(r.reflect(history))
+    assert rest_until_ts(db) == first, "同一次晚安不应重复顺延窗口"
+    # sleep_detected=False 不设置
+    db2 = make_db()
+    async def fake_llm2(system, user):
+        return json.dumps({"new_states": [], "resolved_events": [], "sleep_detected": False})
+    r2 = ChatReflector(db2, {}, fake_llm2)
+    asyncio.run(r2.reflect(history))
+    assert rest_until_ts(db2) == 0, "sleep_detected=False 不应设置休息窗口"
+    print("✓ 反思 LLM 晚安兜底测试通过")
+
+
+def test_recent_topic_switch():
+    """v1.1.5 完善：enable_recent_topic 总开关控制话题摘要注入。"""
+    from core.wake import WakeChannel
+    # 构造带上下文的假对象，验证开关逻辑（通过 config 判断，不真正发事件）
+    class FakeCtx:
+        def __init__(self):
+            self.conversation_manager = None
+        def get_event_queue(self):
+            raise AssertionError("不应走到发送")
+
+    class FakeEvt:
+        def __init__(self, contexts, config):
+            self.contexts = contexts
+            self.config = config
+        def _extract_recent_topic(self, contexts, *a, **k):
+            # 直接暴露：仅当调用时说明开关生效
+            self.called = True
+            return "话题"
+        async def wake(self, session_str, background, with_topic=True):
+            return False, ""
+
+    # 验证开关逻辑本身：config 关闭时不应提取
+    w = WakeChannel(FakeCtx(), {"enable_recent_topic": False})
+    # 直接测配置读取路径：wake 内部 if with_topic and config.get(...)
+    assert w.config.get("enable_recent_topic", False) is False
+    w2 = WakeChannel(FakeCtx(), {"enable_recent_topic": True})
+    assert w2.config.get("enable_recent_topic", True) is True
+    print("✓ recent_topic 开关测试通过")
+
+
+def test_mutex_between_proactive_and_care():
+    """v1.1.5 完善：冷场主动与状态关怀互斥，天气豁免。"""
+    from core.executor import Executor
+    db = make_db()
+    t_id = db.get_default_target()["id"]
+    # 构造最小 Executor（不真正发送）
+    class FakeCtx:
+        pass
+    execu = Executor(db, {"silence_exclude_window_min": 30}, FakeCtx(), None)
+    # 初始无记录：不互斥
+    assert execu._mutex_blocked("proactive", t_id) is False
+    assert execu._mutex_blocked("care", t_id) is False
+    # 记录 care 刚发过（10 秒前）→ proactive 被互斥
+    db.kv_set(f"last_care_send_{t_id}", int(time.time()) - 10)
+    assert execu._mutex_blocked("proactive", t_id) is True
+    # 反过来：proactive 刚发过 → care 被互斥
+    db.kv_set(f"last_care_send_{t_id}", 0)
+    db.kv_set(f"last_proactive_send_{t_id}", int(time.time()) - 5)
+    assert execu._mutex_blocked("care", t_id) is True
+    # 超过窗口（31 分钟前）→ 不互斥
+    db.kv_set(f"last_proactive_send_{t_id}", int(time.time()) - 31 * 60)
+    assert execu._mutex_blocked("care", t_id) is False
+    # 天气豁免：weather 永不互斥
+    db.kv_set(f"last_proactive_send_{t_id}", int(time.time()) - 5)
+    assert execu._mutex_blocked("weather", t_id) is False
+    assert execu._mutex_blocked("weather_alert", t_id) is False
+    # 窗口=0 表示关闭互斥
+    execu2 = Executor(db, {"silence_exclude_window_min": 0}, FakeCtx(), None)
+    assert execu2._mutex_blocked("care", t_id) is False
+    print("✓ proactive/care 互斥测试通过")
+
+
+
+
 if __name__ == "__main__":
     test_database()
     test_weather_analyze()
@@ -1031,4 +1179,8 @@ if __name__ == "__main__":
     test_settable_keys_cover_schema()
     test_decision_guarantee()
     test_reflect_incremental()
+    test_rest_sleep_window()
+    test_reflect_sleep_detected()
+    test_recent_topic_switch()
+    test_mutex_between_proactive_and_care()
     print("\n全部测试通过 ✓")

@@ -128,21 +128,9 @@ class CareMonitor:
 
     # ---------- 勿扰时段 ----------
     def _in_dnd(self) -> bool:
-        """是否处于勿扰时段（与 decision/executor 对齐）。"""
-        dnd_start = str(self.config.get("dnd_start", "23:00"))
-        dnd_end = str(self.config.get("dnd_end", "08:00"))
-        try:
-            sh, sm = map(int, dnd_start.split(":"))
-            eh, em = map(int, dnd_end.split(":"))
-        except Exception:
-            return False
-        now = datetime.now()
-        cur = now.hour * 60 + now.minute
-        s = sh * 60 + sm
-        e = eh * 60 + em
-        if s < e:
-            return s <= cur < e
-        return cur >= s or cur < e
+        """是否处于安静期 = 勿扰时段 OR 动态休息窗口（v1.1.5 晚安识别）。"""
+        from .rest import in_quiet
+        return in_quiet(self.db, self.config)
 
     # ---------- v1.01 常态天气提示 ----------
     @staticmethod

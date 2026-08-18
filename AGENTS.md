@@ -14,8 +14,9 @@ core/
   monitor.py            感知层：天气检查（显著变化检测 + 常态天气提示）、冷场感知
   reflection.py         理解层：状态反思（ChatReflector）、天气判断（WeatherJudge）、窗口外补扫
   decision.py           决策层：act/plan/silent 决策、category 分轨、保底约束
-  executor.py           执行层：唤醒 bot 本人、计划执行、发送日志
-  wake.py               唤醒通道：AstrBot 事件注入
+  executor.py           执行层：唤醒 bot 本人、计划执行、发送日志、沉默类互斥
+  wake.py               唤醒通道：AstrBot 事件注入（recent_topic 可开关）
+  rest.py               休息窗口：勿扰判定单点（in_quiet）+ 晚安识别（关键词+LLM兜底）
   weather.py            天气数据获取（Open-Meteo / 和风）+ 预警解析
   weather_tool.py       天气查询工具（bot 对话中可自然调用）
   geoip.py              IP 定位
@@ -38,6 +39,8 @@ tests/test_core.py      单元测试（不依赖 astrbot 运行时）
 - 新增事件类型/病因时，检查 care_causes 种子是否需要补充（UPSERT 自动同步）。
 - 新增每日计数类逻辑，优先复用 send_log + count_send_today 的 channel 分轨。
 - 新增功能必须在 `tests/test_core.py` 补测试（不依赖 astrbot 运行时，可独立跑）。
+- 勿扰/休息判定一律走 `core/rest.py` 的 `in_quiet()`，禁止各处重复实现时间判定。
+- 沉默类板块（proactive/care）新增发送路径时，需经过 `_mutex_blocked` 互斥检查（天气豁免）。
 
 ## 测试
 
@@ -60,4 +63,6 @@ python3 tests/test_core.py
 状态: 对话监听 → 流水表 → 反思(LLM提炼) → state事件(按cause归因) → 恢复信号按cause精确关闭
 开口: 决策(act/plan/silent) → 事件注入唤醒 → bot本人 → 写入真实历史
 计数: proactive / weather / care / weather_alert 各自独立，互不挤占
+安静: 勿扰时段 OR 休息窗口(晚安识别) → in_quiet 单点判定；用户发消息打破休息窗口
+互斥: proactive ⇄ care 窗口内只一类开口（silence_exclude_window_min）；weather 豁免
 ```

@@ -36,7 +36,7 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 
-@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.4")
+@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.5")
 class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -485,6 +485,23 @@ class DailyCarePlugin(Star):
             return
         # 记录用户发言时间（冷场监测）
         self.monitor.record_user_message()
+        # v1.1.5 晚安识别（动态休息窗口）：
+        #   用户发消息 = 已醒，先打破旧休息窗口；
+        #   若消息命中「晚安/睡了」，以此刻为锚点设置新的休息窗口（默认 +7h）。
+        #   休息窗口内 monitor/decision/executor 均判定为安静期，不触发任何主动。
+        try:
+            from .core import rest as _rest
+            _rest.break_rest(self.db)
+            if _rest.detect_sleep_text(text):
+                rest_hours = int(self._cfg("rest_after_sleep_hours", 7) or 7)
+                _rest.mark_sleep(self.db, after_hours=rest_hours)
+                until = _rest.rest_until_ts(self.db)
+                logger.info(
+                    "[DailyCare] 晚安识别：进入动态休息窗口，恢复时间=%s（%d 小时后）",
+                    time.strftime("%m-%d %H:%M", time.localtime(until)), rest_hours,
+                )
+        except Exception as e:
+            logger.debug(f"[DailyCare] 休息窗口处理异常(可忽略): {e}")
         # 用户发言后延迟触发一次快速反思
         if reflect:
             asyncio.create_task(self._deferred_reflect())

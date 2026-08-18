@@ -48,21 +48,9 @@ class Executor:
 
     # ---------- 时间判定 ----------
     def in_dnd(self) -> bool:
-        """是否处于勿扰时段"""
-        dnd_start = str(self.config.get("dnd_start", "23:00"))
-        dnd_end = str(self.config.get("dnd_end", "08:00"))
-        try:
-            sh, sm = map(int, dnd_start.split(":"))
-            eh, em = map(int, dnd_end.split(":"))
-        except Exception:
-            return False
-        now = datetime.now()
-        cur = now.hour * 60 + now.minute
-        s = sh * 60 + sm
-        e = eh * 60 + em
-        if s < e:
-            return s <= cur < e
-        return cur >= s or cur < e
+        """是否处于安静期 = 勿扰时段 OR 动态休息窗口（v1.1.5 晚安识别）。"""
+        from .rest import in_quiet
+        return in_quiet(self.db, self.config)
 
     def current_window(self) -> Optional[str]:
         now = datetime.now()
@@ -144,7 +132,12 @@ class Executor:
             if not background:
                 self.db.mark_plan(plan["id"], "skipped")
                 continue
-            ok, _ = await self._woke_for_care(target, background)
+            # v1.1.5：计划关怀(care)与冷场主动互斥——窗口内另一类刚发过则跳过
+            if self._mutex_blocked("care", target["id"]):
+                logger.info("[DailyCare] 计划关怀与冷场主动互斥，跳过本次")
+                self.db.mark_plan(plan["id"], "skipped")
+                continue
+            ok, _ = await self._woke_for_care(target, background, with_topic=False)
             if ok:
                 self.db.mark_plan(plan["id"], "sent")
                 # 记录发送日志（以背景代表"提醒过这件事"，供防重复）
@@ -168,6 +161,24 @@ class Executor:
             return f"last_weather_send_{target_id}"
         return f"last_care_send_{target_id}"
 
+    def _mutex_blocked(self, channel: str, target_id: int) -> bool:
+        """v1.1.5 互斥合并：冷场主动(proactive)与状态/计划关怀(care)内容高度相似
+        （如「我们有一阵子没说话了」「已有 N 分钟没有对话」），同一沉默时段两类
+        几乎同时命中时会连发两条同类消息。此处在发送前做互斥：silence_exclude_window_min
+        分钟内，另一类刚发过则本次直接放弃（决策层已各按自身冷却判断过，这里只做
+        跨板块互斥）。天气(weather)含客观信息量（下雨/降温/预警），不参与互斥。
+        """
+        if channel not in ("proactive", "care"):
+            return False
+        win = int(self.config.get("silence_exclude_window_min", 30))
+        if win <= 0:
+            return False
+        other = "care" if channel == "proactive" else "proactive"
+        last = self.db.kv_get(self._last_send_key(target_id, other), 0)
+        if not last:
+            return False
+        return (time.time() - last) < win * 60
+
     async def execute_immediate(self, background: str, channel: str = "care") -> bool:
         """决策为 act 时立即唤醒开口。channel 区分来源：主动消息传 proactive，关怀传 care。"""
         if self.in_dnd():
@@ -175,7 +186,11 @@ class Executor:
         target = self.db.get_default_target()
         if not target:
             return False
-        ok, _ = await self._woke_for_care(target, background)
+        # v1.1.5：冷场主动与状态关怀互斥（天气豁免）
+        if self._mutex_blocked(channel, target["id"]):
+            logger.info(f"[DailyCare] {channel} 与另一沉默类板块互斥，放弃本次")
+            return False
+        ok, _ = await self._woke_for_care(target, background, with_topic=(channel == "proactive"))
         if ok:
             self.db.add_send_log(target["id"], 0, background[:500], channel)
             # 冷却分轨：按 channel 记录各自最后发送时间
@@ -218,7 +233,7 @@ class Executor:
             background = self._compose_background(target, events)
         if not background:
             return []
-        ok, _ = await self._woke_for_care(target, background)
+        ok, _ = await self._woke_for_care(target, background, with_topic=False)
         if ok:
             self.db.add_send_log(target["id"], 0, background[:500], "test")
             self.db.kv_set(f"last_care_send_{target['id']}", int(time.time()))
@@ -227,7 +242,8 @@ class Executor:
         return []
 
     # ---------- 唤醒（v5.1：交给 WakeChannel，全插件唯一非官方路径被隔离）----------
-    async def _woke_for_care(self, target: dict, background: str) -> tuple[bool, str]:
+    async def _woke_for_care(self, target: dict, background: str,
+                            with_topic: bool = True) -> tuple[bool, str]:
         """唤醒 bot 本人开口（v5 终极方案，v5.1 起实现隔离在 core/wake.py）。
 
         把带真实会话的 CronMessageEvent（is_wake=True）推入事件总线，
@@ -244,4 +260,4 @@ class Executor:
         session_str = self._target_session(target)
         if not session_str:
             return False, ""
-        return await self.wake_channel.wake(session_str, background)
+        return await self.wake_channel.wake(session_str, background, with_topic=with_topic)

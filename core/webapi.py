@@ -18,11 +18,12 @@ PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
 # 只在 overview 返回、可显示可修改，但不在白名单内，保存时被静默过滤。
 SETTABLE_KEYS = {
     "care_level", "care_daily_limit", "enable_chat_monitor", "chat_reflect_interval",
-    "dnd_start", "dnd_end", "weather_check_interval", "enable_weather_judge",
+    "dnd_start", "dnd_end", "rest_after_sleep_hours", "weather_check_interval", "enable_weather_judge",
     "weather_cooldown_hours", "care_cooldown_minutes", "decision_interval",
     "enable_qweather_alerts", "weather_tool_enabled", "decision_llm_id",
     "enable_proactive", "probe_min_silence_min", "probe_max_silence_min",
-    "probe_daily_limit", "probe_interval",
+    "probe_daily_limit", "probe_interval", "enable_recent_topic",
+    "silence_exclude_window_min",
     "relation_cities", "timezone", "target_user_id",
     "target_group_id", "qweather_key",
     "enable_daily_weather_note", "daily_weather_note_limit",

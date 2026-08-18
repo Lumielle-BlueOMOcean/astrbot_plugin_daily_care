@@ -75,19 +75,23 @@ class WakeChannel:
             for it in items:
                 role = it.get("role", "") if isinstance(it, dict) else ""
                 txt = to_text(it).strip()
-                if txt:
-                    pairs.append((role, txt))
+                if not txt:
+                    continue
+                # v1.1.5：只摘用户真实消息作为话题脉络来源。
+                # 不摘 bot 自己的消息（含主动消息）——避免「自己接自己的话」自我强化。
+                if role != "user":
+                    continue
+                pairs.append((role, txt))
             if not pairs:
                 return ""
 
             tail = pairs[-(max_rounds * 2):]
             lines = []
             for role, txt in tail:
-                who = "你" if role == "assistant" else ("用户" if role == "user" else role)
                 snippet = txt.replace("\n", " ").strip()
                 if len(snippet) > 80:
                     snippet = snippet[:80] + "…"
-                lines.append(f"{who}：{snippet}")
+                lines.append(f"用户：{snippet}")
             summary = "；".join(lines)
             if len(summary) > max_chars:
                 summary = summary[:max_chars] + "…"
@@ -95,12 +99,15 @@ class WakeChannel:
         except Exception:
             return ""
 
-    async def wake(self, session_str: str, background: str) -> tuple[bool, str]:
+    async def wake(self, session_str: str, background: str,
+                   with_topic: bool = True) -> tuple[bool, str]:
         """无痕唤醒 bot 本人。返回 (是否成功, 背景文本)。
 
         session_str: 目标会话的 unified_msg_origin（如 平台实例:消息类型:用户ID）
         background:  客观背景事实（作为"自己记得的事"注入给 bot 本人感知，
                      不进入会话显示，不进入对话流）
+        with_topic:  是否注入最近话题脉络。有具体背景的唤醒（天气/状态关怀）
+                     背景本身就是开口理由，不需要话题接续；仅冷场主动需要。
         """
         if not session_str or not background:
             return False, ""
@@ -131,7 +138,12 @@ class WakeChannel:
                 if conversation:
                     req.conversation = conversation
                     req.contexts = json.loads(conversation.history or "[]")
-                    recent_topic = self._extract_recent_topic(req.contexts)
+                    # v1.1.5：仅冷场主动等需要话题接续的唤醒才提取；具体关怀不注入话题
+                    # v1.1.5 完善：recent_topic 注入做总开关（enable_recent_topic，
+                    # 默认关闭）——完整会话历史 + 长期记忆已足够支撑话题延续，
+                    # 摘要层默认移除，避免自我强化与复读；需要时可在面板开启。
+                    if with_topic and self.config.get("enable_recent_topic", False):
+                        recent_topic = self._extract_recent_topic(req.contexts)
             except Exception as e:
                 logger.warning(f"[DailyCare] 加载会话历史失败(将无历史唤醒): {e}")
 

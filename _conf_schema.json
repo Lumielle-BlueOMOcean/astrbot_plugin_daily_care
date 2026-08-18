@@ -59,6 +59,12 @@
     "default": "08:00",
     "hint": "勿扰结束时间"
   },
+  "rest_after_sleep_hours": {
+    "type": "int",
+    "description": "晚安识别：用户说晚安后休息多少小时（动态勿扰，熬夜越晚恢复越晚；用户发消息立即打破）",
+    "default": 7,
+    "hint": "晚安后休息小时数（动态勿扰）"
+  },
   "timezone": {
     "type": "string",
     "description": "时区",
@@ -172,5 +178,17 @@
     "description": "两次常态天气提示的最小间隔（分钟）",
     "hint": "常态提示间隔",
     "default": 60
+  },
+  "enable_recent_topic": {
+    "type": "bool",
+    "description": "冷场主动时是否注入最近话题摘要（默认关闭：由完整会话历史+长期记忆支撑话题延续，避免自我强化复读）",
+    "default": false,
+    "hint": "冷场主动注入最近话题摘要（默认关）"
+  },
+  "silence_exclude_window_min": {
+    "type": "int",
+    "description": "沉默类消息互斥窗口（分钟）：冷场主动与状态/计划关怀内容高度相似（如\"好久没说话\"），此窗口内只允许一类开口，避免连发同类消息；天气提醒含客观信息量，不参与互斥",
+    "default": 30,
+    "hint": "冷场/关怀互斥窗口（分钟）"
   }
 }

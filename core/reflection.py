@@ -179,7 +179,8 @@ class ChatReflector:
             '"detail":"一句话说明依据（引用用户原话或客观描述，不评价）",'
             '"intensity":1-5（严重程度）,'
             '"confidence":0-1（你有多确定）}],'
-            '"resolved_events":[{"event_id":整数,"reason":"一句话依据"}]}\n\n'
+            '"resolved_events":[{"event_id":整数,"reason":"一句话依据"}],'
+            '"sleep_detected":true或false（用户是否表达了正要去睡觉，见规则9）}\n\n'
             "规则：\n"
             "1. 只提取对话中【新出现】的状态，忽略已经过去很久的旧事。\n"
             "2. 用户用任何自然语言表达不适都算（如'嗓子像吞刀片''整个人被抽空'），不要只认关键词。\n"
@@ -196,6 +197,10 @@ class ChatReflector:
             "吃辣/吃冰/吃烧烤→diet；发烧/头疼/嗓子疼→sick；受伤/摔了→injury。\n"
             "7. 普通日常闲聊、与用户状态无关的内容，不要提取。\n"
             "8. 没有新状态时 new_states 输出 []，没有事件结束时 resolved_events 输出 []。\n"
+            "9. 【晚安识别】判断用户是否明确表达了『正要去睡觉/休息』：直接说晚安、睡了、"
+            "去睡觉等直白说法，以及委婉说法（'我撑不住了''眼皮打架了''先下了''困到不行'等，"
+            "任何自然表达都算）都算。若是则 sleep_detected 置 true，否则 false。"
+            "注意：'还没睡''睡不着''熬夜''刚睡醒'等不表示『正要去睡』，置 false。\n"
         )
         lines = []
         if new_start > 0:
@@ -293,6 +298,21 @@ class ChatReflector:
             target["id"],
             {hashlib.md5(m["content"].encode("utf-8")).hexdigest() for m in user_msgs},
         )
+
+        # v1.1.5：晚安识别 LLM 兜底——关键词未覆盖的委婉表达由反思 LLM 判定。
+        # 防重复：若休息窗口已在生效（关键词已命中）且距上次标记不足 1 小时，
+        # 视为同一次晚安，不重复顺延窗口；否则以当前时间为锚点设置休息窗口。
+        if parsed.get("sleep_detected"):
+            try:
+                from .rest import mark_sleep, rest_since_ts, in_rest_window
+                now = now_ts()
+                since = rest_since_ts(self.db)
+                if not in_rest_window(self.db) or (now - since) > 3600:
+                    hours = int(self.config.get("rest_after_sleep_hours", 7) or 7)
+                    mark_sleep(self.db, after_hours=hours)
+                    logger.info("[DailyCare] 反思 LLM 兜底：检测到用户表达晚安，进入动态休息窗口")
+            except Exception as e:
+                logger.debug(f"[DailyCare] 反思晚安兜底异常(可忽略): {e}")
 
         # v5.7.1：统一由 _apply_new_states 处理新状态（含 recovery 兜底），主分析与补扫复用
         created = self._apply_new_states(target["id"], parsed["new_states"])
@@ -603,7 +623,7 @@ class ChatReflector:
         - 旧版数组：[...]（视为 new_states，resolved_events 为空）
         """
         if not text:
-            return {"new_states": [], "resolved_events": []}
+            return {"new_states": [], "resolved_events": [], "sleep_detected": False}
         text = text.strip()
         if text.startswith("```"):
             lines = text.splitlines()
@@ -621,9 +641,11 @@ class ChatReflector:
                 if isinstance(data, dict) and ("new_states" in data or "resolved_events" in data):
                     ns = data.get("new_states")
                     re_ = data.get("resolved_events")
+                    sd = data.get("sleep_detected")
                     return {
                         "new_states": ns if isinstance(ns, list) else [],
                         "resolved_events": re_ if isinstance(re_, list) else [],
+                        "sleep_detected": bool(sd),
                     }
             except Exception:
                 pass
@@ -634,10 +656,10 @@ class ChatReflector:
             try:
                 data = json.loads(text[start:end + 1])
                 if isinstance(data, list):
-                    return {"new_states": data, "resolved_events": []}
+                    return {"new_states": data, "resolved_events": [], "sleep_detected": False}
             except Exception:
                 pass
-        return {"new_states": [], "resolved_events": []}
+        return {"new_states": [], "resolved_events": [], "sleep_detected": False}
 
 
 class WeatherJudge:
