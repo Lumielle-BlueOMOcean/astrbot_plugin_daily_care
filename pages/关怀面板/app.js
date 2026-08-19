@@ -115,9 +115,8 @@ const FORM_META = {
     ["platform_id", "平台实例ID", "auto", "auto 自动解析；多实例时手动指定"],
   ],
   targets: [
-    ["target_user_id", "目标用户QQ", "", "默认关怀对象；留空则关怀所有用户"],
-    ["target_group_id", "目标群号(可选)", "", "关怀群号；留空仅私聊"],
-    ["relation_cities", "关系人城市(JSON)", "[]", "JSON数组：[{'qq':'123','city':'重庆'}]"],
+    ["target_user_id", "我的QQ", "", "默认关怀对象；留空则收到首条消息后自动捕获"],
+    ["target_city", "我的城市", "", "优先使用；留空则自动IP定位"],
   ],
 };
 
@@ -156,11 +155,114 @@ function buildForm(containerId, meta, values) {
         <div class="win-custom">${customTags}<span class="muted" data-placeholder="${key}" style="${customs.length ? "display:none" : ""}">暂无自定义时段</span></div>
         <div class="win-add"><input type="text" data-add-win="${key}" placeholder="HH:MM-HH:MM，如 07:00-08:00" /><button type="button" class="btn btn-ghost btn-sm" data-add-btn="${key}">添加</button></div>
       </div>`;
+    } else if (key === "target_city") {
+      // v1.1.6：城市级联下拉（省 市 区县），替代裸输入框；旧值如「成都」自动反查回省市区
+      const [curProv, curCity, curDist] = resolveCityPath(String(val || ""));
+      const provs = Object.keys(AREA["中国"] || {});
+      const cities = curProv ? Object.keys((AREA["中国"][curProv] || {})) : [];
+      const dists = (curProv && curCity) ? ((AREA["中国"][curProv] || {})[curCity] || []) : [];
+      const opt = (list, cur) => ["", ...list].map((x) => `<option value="${x}" ${x === cur ? "selected" : ""}>${x || "请选择"}</option>`).join("");
+      input = `<div class="area-cascade" data-city-cascade="1">
+        <select data-casc-prov style="flex:0 0 30%">${opt(provs, curProv)}</select>
+        <select data-casc-city style="flex:0 0 30%">${opt(cities, curCity)}</select>
+        <select data-casc-dist>${opt(dists, curDist)}</select>
+        <input type="hidden" data-key="target_city" value="${esc(String(val || ""))}" />
+      </div>`;
     } else {
       input = `<input type="text" data-key="${key}" value="${esc(String(val))}" />`;
     }
-    div.innerHTML = `<label class="form-label">${label}</label>${input}${hint ? `<p class="form-hint">${hint}</p>` : ""}`;
+    // v1.1.6：关键配置空值提示（防静默失效）
+    let warn = "";
+    if (key === "target_user_id" && !String(val || "").trim()) {
+      warn = `<p class="form-warn">⚠️ 未手动设置：收到你的首条消息后将自动捕获并锁定该 QQ</p>`;
+    } else if (key === "platform_id" && !String(val || "").trim()) {
+      warn = `<p class="form-warn">⚠️ 未设置平台实例：将尝试自动解析；若解析失败可能无法开口，建议填 auto</p>`;
+    }
+    div.innerHTML = `<label class="form-label">${label}</label>${input}${hint ? `<p class="form-hint">${hint}</p>` : ""}${warn}`;
     wrap.appendChild(div);
+  });
+  bindCityCascade(wrap);
+}
+
+// v1.1.6：把城市值解析为 [省, 市, 区县]；旧值如「成都」「武侯区」自动反查所属省市区
+function resolveCityPath(val) {
+  const parts = String(val || "").split(/\s+/).filter(Boolean);
+  const provs = Object.keys(AREA["中国"] || {});
+  const norm = (s) => String(s || "").replace(/市$|县$|区$|自治州$|地区$|盟$/, "");
+  let prov = "", city = "", dist = "";
+  if (!parts.length) return ["", "", ""];
+  let rest = parts.slice();
+  if (provs.includes(rest[0])) { prov = rest.shift(); }
+  const scope = prov ? [prov] : provs;
+  const findCity = (name) => {
+    for (const p of scope) {
+      const cObj = AREA["中国"][p] || {};
+      for (const c of Object.keys(cObj)) {
+        if (c === name || norm(c) === norm(name)) return [p, c];
+      }
+    }
+    return null;
+  };
+  if (rest.length) {
+    const hit = findCity(rest[0]);
+    if (hit) { prov = hit[0]; city = hit[1]; rest.shift(); }
+  }
+  if (rest.length) {
+    const cObj = (prov && city) ? ((AREA["中国"][prov] || {})[city] || []) : [];
+    if (cObj.includes(rest[0])) { dist = rest[0]; rest.shift(); }
+  }
+  // 兜底：只有单个名字且没匹配到市——尝试区县级反查（如「武侯区」）
+  if (!city && parts.length === 1) {
+    const name = parts[0];
+    for (const p of provs) {
+      const cObj = AREA["中国"][p] || {};
+      for (const c of Object.keys(cObj)) {
+        if ((cObj[c] || []).includes(name)) { prov = p; city = c; dist = name; break; }
+      }
+      if (city) break;
+    }
+  }
+  return [prov, city, dist];
+}
+
+// v1.1.6：target_city 级联下拉联动（省→市→区县），同步值到隐藏 data-key 输入框
+function syncCityValue(box) {
+  const prov = box.querySelector("[data-casc-prov]").value;
+  const city = box.querySelector("[data-casc-city]").value;
+  const dist = box.querySelector("[data-casc-dist]").value;
+  const parts = [];
+  if (prov) parts.push(prov);
+  if (city && city !== "市辖区" && city !== "县") parts.push(city);
+  if (dist) parts.push(dist);
+  const input = box.querySelector("[data-key]");
+  if (input) input.value = parts.join(" ");
+}
+function bindCityCascade(root) {
+  root.querySelectorAll("[data-casc-prov]").forEach((sel) => {
+    sel.addEventListener("change", () => {
+      const box = sel.closest(".area-cascade");
+      const prov = sel.value;
+      const citySel = box.querySelector("[data-casc-city]");
+      const distSel = box.querySelector("[data-casc-dist]");
+      const cities = prov ? Object.keys(AREA["中国"][prov] || {}) : [];
+      citySel.innerHTML = ["", ...cities].map((c) => `<option value="${c}">${c || "请选择"}</option>`).join("");
+      distSel.innerHTML = '<option value="">请选择</option>';
+      syncCityValue(box);
+    });
+  });
+  root.querySelectorAll("[data-casc-city]").forEach((sel) => {
+    sel.addEventListener("change", () => {
+      const box = sel.closest(".area-cascade");
+      const prov = box.querySelector("[data-casc-prov]").value;
+      const city = sel.value;
+      const distSel = box.querySelector("[data-casc-dist]");
+      const dists = (prov && city) ? (AREA["中国"][prov][city] || []) : [];
+      distSel.innerHTML = ["", ...dists].map((d) => `<option value="${d}">${d || "请选择"}</option>`).join("");
+      syncCityValue(box);
+    });
+  });
+  root.querySelectorAll("[data-casc-dist]").forEach((sel) => {
+    sel.addEventListener("change", () => syncCityValue(sel.closest(".area-cascade")));
   });
 }
 
@@ -284,16 +386,18 @@ function renderOverview(data) {
 
 function renderTargets(list) {
   const el = document.getElementById("targetList");
-  el.innerHTML = list.map((t) => `
+  // 默认对象（用户自己）在「我的信息」卡片配置，列表只显示加号添加的关系对象
+  const others = (list || []).filter((t) => !t.is_default);
+  el.innerHTML = others.map((t) => `
     <div class="target-item">
       <div class="target-info">
         <b>${esc(t.name)}</b>
         <span class="tag">${esc(t.relation || "—")}</span>
-        ${t.is_default ? '<span class="tag tag-primary">默认</span>' : ""}
-        <span class="muted">${esc(t.location)}</span>
+        ${t.user_id ? `<span class="tag">QQ ${esc(t.user_id)}</span>` : '<span class="tag tag-warn">未填QQ</span>'}
+        <span class="muted">📍 ${esc(t.location)}</span>
       </div>
-      ${t.is_default ? "" : `<button class="btn btn-danger btn-sm" data-del="${t.id}">删除</button>`}
-    </div>`).join("") || '<p class="empty">暂无关怀对象</p>';
+      <button class="btn btn-danger btn-sm" data-del="${t.id}">删除</button>
+    </div>`).join("") || '<p class="empty">还没有关怀对象，点右上角「+ 添加对象」添加你的家人朋友吧</p>';
   el.querySelectorAll("[data-del]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       await api(API.deleteTarget, "POST", { id: btn.dataset.del });
@@ -502,8 +606,50 @@ document.querySelectorAll("#weatherSettings, #decisionSettings, #proactiveSettin
   form.appendChild(save);
 });
 
+// 行政区划级联（中国 → 省 → 市 → 区县）
+const AREA = window.AREAS_DATA || { 中国: {} };
+const PROVINCE_DIRECT = ["北京市", "天津市", "上海市", "重庆市"];
+
+function fillProvinceOptions() {
+  const sel = document.getElementById("areaProvince");
+  sel.innerHTML = '<option value="">请选择省</option>' +
+    Object.keys(AREA["中国"] || {}).map((p) => `<option value="${p}">${p}</option>`).join("");
+}
+function fillCityOptions(prov) {
+  const citySel = document.getElementById("areaCity");
+  const distSel = document.getElementById("areaDistrict");
+  distSel.innerHTML = '<option value="">请选择区县</option>';
+  const cities = (AREA["中国"][prov] || {});
+  citySel.innerHTML = '<option value="">请选择市</option>' +
+    Object.keys(cities).map((c) => `<option value="${c}">${c}</option>`).join("");
+}
+function fillDistrictOptions(prov, city) {
+  const distSel = document.getElementById("areaDistrict");
+  const dists = ((AREA["中国"][prov] || {})[city]) || [];
+  distSel.innerHTML = '<option value="">' + (dists.length ? "请选择区县" : "无区县") + "</option>" +
+    dists.map((d) => `<option value="${d}">${d}</option>`).join("");
+}
+function buildCityName() {
+  const prov = document.getElementById("areaProvince").value;
+  const city = document.getElementById("areaCity").value;
+  const dist = document.getElementById("areaDistrict").value;
+  const parts = [];
+  if (prov) parts.push(prov);
+  if (city && city !== "市辖区" && city !== "县") parts.push(city);
+  if (dist) parts.push(dist);
+  return parts.join(" ");
+}
+function resetAreaSelects() {
+  fillProvinceOptions();
+  fillCityOptions("");
+  fillDistrictOptions("", "");
+}
+document.getElementById("areaProvince")?.addEventListener("change", (e) => fillCityOptions(e.target.value));
+document.getElementById("areaCity")?.addEventListener("change", (e) => fillDistrictOptions(document.getElementById("areaProvince").value, e.target.value));
+
 // 添加对象
 document.getElementById("addTargetBtn").addEventListener("click", () => {
+  resetAreaSelects(); // v1.1.6：打开弹窗时重置级联，确保省下拉有选项
   document.getElementById("modalMask").hidden = false;
 });
 document.getElementById("modalCancel").addEventListener("click", () => {
@@ -512,25 +658,35 @@ document.getElementById("modalCancel").addEventListener("click", () => {
 document.getElementById("modalConfirm").addEventListener("click", async () => {
   const name = document.getElementById("newName").value.trim();
   const relation = document.getElementById("newRelation").value.trim();
-  const city = document.getElementById("newCity").value.trim();
-  if (!name || !city) {
-    document.getElementById("modalErr").textContent = "称呼和城市必填";
+  const user_id = document.getElementById("newUserId").value.trim();
+  const prov = document.getElementById("areaProvince").value;
+  const city = buildCityName();
+  if (!name) {
+    document.getElementById("modalErr").textContent = "称呼必填";
+    return;
+  }
+  const onlyProvince = prov && !document.getElementById("areaCity").value && !PROVINCE_DIRECT.includes(prov);
+  if (!city || onlyProvince) {
+    document.getElementById("modalErr").textContent = "请选择城市（至少选到市一级）";
     return;
   }
   try {
-  const r = await api(API.addTarget, "POST", { name, relation, city });
-  if (r.code === 0) {
-    document.getElementById("modalMask").hidden = true;
-    document.getElementById("newName").value = "";
-    document.getElementById("newRelation").value = "";
-    document.getElementById("newCity").value = "";
-    load();
-  } else {
-    document.getElementById("modalErr").textContent = r.data?.message || r.message || "添加失败";
-  }
+    const r = await api(API.addTarget, "POST", { name, relation, user_id, city });
+    if (r.code === 0) {
+      document.getElementById("modalMask").hidden = true;
+      document.getElementById("newName").value = "";
+      document.getElementById("newRelation").value = "";
+      document.getElementById("newUserId").value = "";
+      resetAreaSelects();
+      load();
+    } else {
+      document.getElementById("modalErr").textContent = r.data?.message || r.message || "添加失败";
+    }
   } catch (e) {
     document.getElementById("modalErr").textContent = e.message || "添加失败";
   }
 });
 
 load();
+// v1.1.6：页面加载时初始化省市区级联（省下拉填充 34 个省，否则无法选择）
+resetAreaSelects();

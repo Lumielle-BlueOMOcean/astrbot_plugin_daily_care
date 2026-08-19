@@ -24,7 +24,7 @@ SETTABLE_KEYS = {
     "enable_proactive", "probe_min_silence_min", "probe_max_silence_min",
     "probe_daily_limit", "probe_interval", "enable_recent_topic",
     "silence_exclude_window_min",
-    "relation_cities", "timezone", "target_user_id",
+    "relation_cities", "timezone", "target_user_id", "target_city",
     "target_group_id", "qweather_key",
     "enable_daily_weather_note", "daily_weather_note_limit",
     "daily_weather_note_window", "daily_weather_note_gap_min",
@@ -180,25 +180,33 @@ class CareWebAPI:
         try:
             import aiohttp
             from . import geoip
-            async with aiohttp.ClientSession() as s:
-                loc = await geoip.locate_by_ip(s)
+            loc = None
+            # v1.1.6：手动指定城市优先，否则 IP 定位
+            target_city = str(self.plugin._cfg("target_city", "") or "").strip()
+            if target_city:
+                gc = await geoip.geocode_city(target_city)
+                if gc:
+                    loc = {"city": gc["city"], "lat": gc["lat"], "lon": gc["lon"],
+                           "region": gc.get("region", "")}
+            if not loc:
+                async with aiohttp.ClientSession() as s:
+                    loc = await geoip.locate_by_ip(s)
             if not loc:
                 return self._err("IP 定位失败（可能是出口 IP 无城市信息）")
             db = self.plugin.db
             default = db.get_default_target()
-            dyn = db.get_dynamic_location()
-            if dyn:
-                # 城市变化则更新坐标；城市相同则只刷新定位时间
-                if dyn["name"] != loc["city"]:
-                    db.upsert_location(loc["city"], loc["lat"], loc["lon"], "dynamic", loc["region"])
-                    if default:
-                        db.update_target_location(default["id"], dyn["id"])
-                db.kv_set("last_ip_locate_ts", int(time.time()))
+            # v1.1.6：动态定位唯一化——修复旧版 upsert 城市名不同会 INSERT 新记录、
+            # 且 update_target_location 用了旧 dyn id 导致默认目标仍指向旧城市的问题
+            old_dyn = db.get_dynamic_location()
+            if default:
+                new_id = db.sync_dynamic_location(
+                    loc["city"], loc["lat"], loc["lon"], loc["region"], default["id"]
+                )
+                if old_dyn and old_dyn["name"] != loc["city"]:
+                    db.expire_weather_events_by_location(default["id"], old_dyn["id"])
             else:
-                loc_id = db.upsert_location(loc["city"], loc["lat"], loc["lon"], "dynamic", loc["region"])
-                if default:
-                    db.update_target_location(default["id"], loc_id)
-                db.kv_set("last_ip_locate_ts", int(time.time()))
+                db.sync_dynamic_location(loc["city"], loc["lat"], loc["lon"], loc["region"])
+            db.kv_set("last_ip_locate_ts", int(time.time()))
             return self._ok({
                 "city": loc["city"], "region": loc.get("region", ""),
                 "lat": loc["lat"], "lon": loc["lon"],
@@ -211,6 +219,7 @@ class CareWebAPI:
         name = str(body.get("name", "")).strip()
         city = str(body.get("city", "")).strip()
         relation = str(body.get("relation", "")).strip()
+        user_id = str(body.get("user_id", "")).strip()
         if not name or not city:
             return self._err("name 和 city 不能为空")
         try:
@@ -220,10 +229,10 @@ class CareWebAPI:
                 return self._err(f"无法定位城市「{city}」，请检查城市名")
             db = self.plugin.db
             loc_id = db.upsert_location(gc["city"], gc["lat"], gc["lon"], "static", gc["region"])
-            db.add_target(name, relation, loc_id)
+            db.add_target(name, relation, loc_id, user_id=user_id)
             # 同步到配置
             await self._sync_relation_cities()
-            return self._ok({"name": name, "city": gc["city"], "message": "已添加关怀对象"})
+            return self._ok({"name": name, "city": gc["city"], "user_id": user_id, "message": "已添加关怀对象"})
         except Exception as e:
             logger.error(f"[DailyCare] 添加关怀对象失败: {e}")
             return self._err(f"添加失败: {e}")
@@ -255,7 +264,12 @@ class CareWebAPI:
         for t in targets:
             loc = db.get_location(t["location_id"]) if t["location_id"] else None
             if loc:
-                rels.append({"name": t["name"], "relation": t.get("relation", ""), "city": loc["name"]})
+                rels.append({
+                    "qq": t.get("user_id", ""),
+                    "name": t["name"],
+                    "relation": t.get("relation", ""),
+                    "city": loc["name"],
+                })
         await self._update_config({"relation_cities": json.dumps(rels, ensure_ascii=False)})
 
     # ---------- 事件 ----------

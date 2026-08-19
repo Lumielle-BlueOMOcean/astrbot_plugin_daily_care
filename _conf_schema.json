@@ -5,6 +5,12 @@
     "hint": "关怀对象QQ；留空则关怀所有本机用户",
     "default": ""
   },
+  "target_city": {
+    "type": "string",
+    "description": "手动指定关怀对象城市；留空则自动 IP 定位",
+    "hint": "手动指定城市；留空自动定位",
+    "default": ""
+  },
   "target_group_id": {
     "type": "string",
     "description": "关怀群号（可选，留空则只在私聊关怀）",

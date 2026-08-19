@@ -36,7 +36,7 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 
-@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.5")
+@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.6")
 class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -90,12 +90,17 @@ class DailyCarePlugin(Star):
 
     # ---------- 生命周期 ----------
     async def initialize(self):
+        default_uid = str(self._cfg("target_user_id", "") or "").strip().split(",")[0].strip()
         self.umo = self._default_session()
         self.persona_prompt = await self._load_persona()
         try:
             import aiohttp
             async with aiohttp.ClientSession() as s:
-                await self.monitor.ensure_targets(s)
+                await self.monitor.ensure_targets(s, default_uid=default_uid)
+            # v1.1.6：升级自愈——清理旧版手动定位可能遗留的孤儿动态定位记录
+            n = self.db.cleanup_orphan_dynamic_locations()
+            if n:
+                logger.info(f"[DailyCare] 启动自愈：清理孤儿动态定位记录 {n} 条")
         except Exception as e:
             logger.warning(f"[DailyCare] 初始化目标失败: {e}")
 
@@ -197,10 +202,34 @@ class DailyCarePlugin(Star):
         return str(r or "")
 
     # ---------- 会话 ----------
+    def _dynamic_platform_id(self) -> str:
+        """动态解析真实平台实例 ID（v1.1.6：修复亚托莉机器上唤醒失败）。
+
+        优先级：显式配置 platform_id（非 auto）> 已注册平台实例 > 兜底 Lumielle。
+        不再硬编码，避免实例名不同的机器（如 Atri 3）上会话不匹配。
+        """
+        pid = str(self._cfg("platform_id", "") or "").strip()
+        if pid and pid != "auto":
+            return pid
+        try:
+            pm = getattr(self.context, "platform_manager", None)
+            if pm is not None:
+                insts = getattr(pm, "platform_insts", None) or []
+                for inst in insts:
+                    pid = (getattr(inst, "config", None) or {}).get("id", "")
+                    if pid and pid != "webchat":
+                        return pid
+        except Exception as e:
+            logger.warning(f"[DailyCare] 动态解析平台实例失败: {e}")
+        return "Lumielle"
+
     def _default_session(self) -> str:
         uid = str(self._cfg("target_user_id", "") or "").strip()
         uid = uid.split(",")[0].strip()
-        return f"Lumielle:FriendMessage:{uid}" if uid else ""
+        if not uid:
+            return ""
+        pid = self._dynamic_platform_id()
+        return f"{pid}:FriendMessage:{uid}"
 
     # ---------- LLM 调用（支持独立配置决策 LLM）----------
     async def _llm_call(self, system_prompt: str, user_prompt: str,
@@ -306,9 +335,23 @@ class DailyCarePlugin(Star):
         """
         if not self._decision or not self._executor:
             return "silent"
-        target = self.db.get_default_target()
-        if not target:
+        targets = self.db.get_all_targets()
+        if not targets:
             return "silent"
+        default = self.db.get_default_target()
+        default_id = default["id"] if default else None
+        acted = False
+        for target in targets:
+            try:
+                r = await self._run_decision_for_target(target, source=source, guarantee=(guarantee and target["id"] == default_id))
+                if r == "act":
+                    acted = True
+            except Exception as e:
+                logger.warning(f"[DailyCare] 目标 {target.get('name')} 决策异常: {e}")
+        return "act" if acted else "silent"
+
+    async def _run_decision_for_target(self, target: dict, source: str = "auto", guarantee: bool = False) -> str:
+        """对单个关怀对象执行一次决策并落地。返回 decision 值。"""
         result = await self._decision.decide(target, source=source, guarantee=guarantee)
         if not result:
             # 保底触发时 LLM 失败也不能静默放弃：直接尝试开口
@@ -352,7 +395,7 @@ class DailyCarePlugin(Star):
                     if (time.time() - last) < cooldown_min * 60:
                         logger.info(f"[DailyCare] {channel} 决策被冷却拦截（距上次{channel}开口过近）")
                         return "act_cooled"
-                ok = await self._executor.execute_immediate(bg, channel=channel)
+                ok = await self._executor.execute_immediate(bg, channel=channel, target=target)
                 if ok:
                     logger.info(f"[DailyCare] 已按决策立即开口: {bg[:40]}...")
                     return "act"
@@ -461,6 +504,8 @@ class DailyCarePlugin(Star):
     # ---------- 聊天入口 ----------
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_private_message(self, event: AstrMessageEvent):
+        uid = str(getattr(event.message_obj.sender, "user_id", "") or "")
+        self._auto_capture_user(uid)
         await self._monitor_event(event)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -469,7 +514,44 @@ class DailyCarePlugin(Star):
         target_uid = str(self._cfg("target_user_id", "") or "").strip()
         if target_uid and uid not in target_uid.split(","):
             return
+        self._auto_capture_user(uid)
         await self._monitor_event(event, reflect=False)
+
+    def _auto_capture_user(self, uid: str) -> None:
+        """v1.1.6：自动捕获关怀对象 QQ 号（开箱即用，无需手动配置）。
+
+        规则：
+          1. 配置 target_user_id 显式填写 → 不覆盖，尊重手动配置；
+          2. 默认目标 user_id 已存在 → 不重复捕获；
+          3. 首次收到用户消息（排除自己）且默认目标无 uid → 回填数据库
+             并回写配置，重启后依然生效。
+        """
+        uid = str(uid or "").strip()
+        if not uid:
+            return
+        cfg_uid = str(self._cfg("target_user_id", "") or "").strip()
+        if cfg_uid:
+            return
+        try:
+            default = self.db.get_default_target()
+            if default is not None and str(default.get("user_id") or "").strip():
+                return  # 已有关联，无需重复捕获
+            if default is None:
+                loc_id = self.db.upsert_location("动态定位", 0, 0, "dynamic", "IP")
+                self.db.add_target("你", "用户自己", loc_id, user_id=uid,
+                                   is_default=1, is_dynamic=1)
+            else:
+                self.db.update_target_user_id(default["id"], uid)
+            # 回写配置，保证重启后仍生效
+            try:
+                self.config["target_user_id"] = uid
+                if hasattr(self.config, "save_config"):
+                    self.config.save_config()
+            except Exception:
+                pass
+            logger.info(f"[DailyCare] 已自动捕获关怀对象 QQ: {uid}")
+        except Exception as e:
+            logger.debug(f"[DailyCare] 自动捕获失败(可忽略): {e}")
 
     async def _monitor_event(self, event: AstrMessageEvent, reflect: bool = True):
         mid = str(getattr(event.message_obj, "message_id", "") or "")

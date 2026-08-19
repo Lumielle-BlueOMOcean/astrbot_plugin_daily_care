@@ -44,12 +44,21 @@ class CareMonitor:
         self.config = config
 
     # ---------- 初始化目标 ----------
-    async def ensure_targets(self, session=None) -> None:
-        """确保默认目标（用户自己）和配置的关系人物存在"""
+    async def ensure_targets(self, session=None, default_uid="") -> None:
+        """确保默认目标（用户自己）和配置的关系人物存在
+
+        v1.1.6：创建默认目标时回填 user_id；若旧版本已建默认目标但
+        user_id 为空（add_target 未传 user_id 的历史缺陷），启动时自愈回填。
+        """
+        default_uid = str(default_uid or "").strip()
         default = self.db.get_default_target()
         if default is None:
             loc_id = self.db.upsert_location("动态定位", 0, 0, "dynamic", "IP")
-            self.db.add_target("你", "用户自己", loc_id, is_default=1, is_dynamic=1)
+            self.db.add_target("你", "用户自己", loc_id, user_id=default_uid,
+                               is_default=1, is_dynamic=1)
+        elif not str(default.get("user_id") or "").strip() and default_uid:
+            self.db.update_target_user_id(default["id"], default_uid)
+            logger.info(f"[DailyCare] 已自愈默认目标 user_id: {default_uid}")
         try:
             relations = json.loads(self.config.get("relation_cities", "[]") or "[]")
         except Exception:
@@ -238,30 +247,32 @@ class CareMonitor:
             # v5.8.3：先清理已过 TTL 的过期事件（天气提醒当天有效，过了就清）
             self.db.expire_stale_events()
 
-            # 1. 用户动态地点：IP 定位（每天最多一次，缓存）
+            # 1. 用户动态地点：手动指定城市优先，否则 IP 定位（每天最多一次，缓存）
             loc = None
-            last_ip_locate = self.db.kv_get("last_ip_locate_ts", 0)
-            if time.time() - last_ip_locate > 12 * 3600:
-                loc = await geoip.locate_by_ip(session)
-                self.db.kv_set("last_ip_locate_ts", int(time.time()))
+            target_city = str(self.config.get("target_city", "") or "").strip()
+            if target_city:
+                # v1.1.6：手动指定城市最可靠（IP 定位对移动宽带常不准）
+                gc = await geoip.geocode_city(target_city, session)
+                if gc:
+                    loc = {"city": gc["city"], "lat": gc["lat"], "lon": gc["lon"],
+                           "region": gc.get("region", "")}
+            else:
+                last_ip_locate = self.db.kv_get("last_ip_locate_ts", 0)
+                if time.time() - last_ip_locate > 12 * 3600:
+                    loc = await geoip.locate_by_ip(session)
+                    self.db.kv_set("last_ip_locate_ts", int(time.time()))
             default = self.db.get_default_target()
             if loc and default:
-                dyn_loc = self.db.get_dynamic_location()
-                if not dyn_loc:
-                    loc_id = self.db.upsert_location(loc["city"], loc["lat"], loc["lon"], "dynamic", loc["region"])
-                    self.db.update_target_location(default["id"], loc_id)
-                elif dyn_loc["name"] != loc["city"]:
+                # v1.1.6：动态定位唯一化（复用目标指向的动态记录 + 清孤儿 + 城市变化清缓存）
+                old_dyn = self.db.get_dynamic_location()
+                self.db.sync_dynamic_location(
+                    loc["city"], loc["lat"], loc["lon"], loc["region"], default["id"]
+                )
+                if old_dyn and old_dyn["name"] != loc["city"]:
                     # v5.8.3：地点切换 → 旧地点的天气事件全部失效（人走了，旧天气提醒没意义）
-                    old_loc_id = dyn_loc["id"]
-                    with self.db._connect() as conn:
-                        conn.execute(
-                            "UPDATE locations SET name=?, lat=?, lon=?, region=? WHERE id=?",
-                            (loc["city"], loc["lat"], loc["lon"], loc["region"], dyn_loc["id"]),
-                        )
-                    if default:
-                        n = self.db.expire_weather_events_by_location(default["id"], old_loc_id)
-                        if n:
-                            logger.info(f"[DailyCare] 地点切换 {loc['city']}，旧地点天气事件失效 {n} 条")
+                    n = self.db.expire_weather_events_by_location(default["id"], old_dyn["id"])
+                    if n:
+                        logger.info(f"[DailyCare] 地点切换 {loc['city']}，旧地点天气事件失效 {n} 条")
                     logger.info(f"[DailyCare] 动态地点更新为: {loc['city']}")
 
             # 2. 遍历所有地点查天气

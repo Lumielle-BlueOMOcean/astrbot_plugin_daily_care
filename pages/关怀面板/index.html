@@ -124,13 +124,13 @@
 
       <!-- 关怀对象 -->
       <section class="section" id="sec-targets">
-        <div class="sec-head"><h2>关怀对象</h2><button class="btn btn-primary btn-sm" id="addTargetBtn">+ 添加</button></div>
+        <div class="sec-head"><h2>关怀对象</h2></div>
         <div class="panel">
-          <div class="panel-head"><h3>默认关怀对象</h3></div>
+          <div class="panel-head"><h3>我的信息（默认对象）</h3><span class="hint">QQ 留空则收到首条消息后自动捕获；城市留空则自动 IP 定位</span></div>
           <div class="form-grid" id="targetsSettings"></div>
         </div>
         <div class="panel">
-          <div class="panel-head"><h3>对象列表</h3></div>
+          <div class="panel-head"><h3>关怀对象列表</h3><button class="btn btn-primary btn-sm" id="addTargetBtn">+ 添加对象</button></div>
           <div class="target-list" id="targetList"></div>
         </div>
       </section>
@@ -187,7 +187,15 @@
       <h3>添加关怀对象</h3>
       <label>称呼 <input id="newName" placeholder="如：老妈" /></label>
       <label>关系 <input id="newRelation" placeholder="如：妈妈" /></label>
-      <label>城市 <input id="newCity" placeholder="如：长沙" /></label>
+      <label>QQ 号 <input id="newUserId" placeholder="如：123456789" /></label>
+      <label>城市
+        <div class="area-cascade">
+          <select id="areaCountry"><option value="中国">中国</option></select>
+          <select id="areaProvince"><option value="">请选择省</option></select>
+          <select id="areaCity"><option value="">请选择市</option></select>
+          <select id="areaDistrict"><option value="">请选择区县</option></select>
+        </div>
+      </label>
       <div class="modal-actions">
         <button class="btn btn-ghost" id="modalCancel">取消</button>
         <button class="btn btn-primary" id="modalConfirm">确认添加</button>
@@ -196,6 +204,7 @@
     </div>
   </div>
 
+  <script src="./areas.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>

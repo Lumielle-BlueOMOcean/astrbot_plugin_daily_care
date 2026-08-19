@@ -74,6 +74,17 @@ class Executor:
             return pid
         if self.session and ":" in self.session:
             return self.session.split(":")[0]
+        # v1.1.6：动态从已注册平台实例获取真实 platform_id（不硬编码 Lumielle）
+        try:
+            pm = getattr(self.context, "platform_manager", None)
+            if pm is not None:
+                insts = getattr(pm, "platform_insts", None) or []
+                for inst in insts:
+                    pid = (getattr(inst, "config", None) or {}).get("id", "")
+                    if pid and pid != "webchat":
+                        return pid
+        except Exception as e:
+            logger.warning(f"[DailyCare] 动态解析平台实例失败: {e}")
         return "Lumielle"
 
     # ---------- 会话上下文（仅反思读取历史用，不参与直发）----------
@@ -109,13 +120,15 @@ class Executor:
         if self.in_dnd():
             return []
         today = datetime.now().strftime("%Y-%m-%d")
-        target = self.db.get_default_target()
-        if not target:
-            return []
         now_ts = int(time.time())
         plans = self.db.get_pending_plans(today)
         sent = []
         for plan in plans:
+            # v1.1.6：计划按各自 target 发送（多对象关怀），默认对象作为兜底
+            target = self.db.get_target(plan.get("target_id") or 0) or self.db.get_default_target()
+            if not target:
+                self.db.mark_plan(plan["id"], "skipped")
+                continue
             # 触发判定：已到随机时刻，或窗口匹配且已过窗口起点
             trigger_ts = plan.get("trigger_ts") or 0
             window = plan.get("trigger_window") or ""
@@ -179,11 +192,15 @@ class Executor:
             return False
         return (time.time() - last) < win * 60
 
-    async def execute_immediate(self, background: str, channel: str = "care") -> bool:
-        """决策为 act 时立即唤醒开口。channel 区分来源：主动消息传 proactive，关怀传 care。"""
+    async def execute_immediate(self, background: str, channel: str = "care", target: Optional[dict] = None) -> bool:
+        """决策为 act 时立即唤醒开口。channel 区分来源：主动消息传 proactive，关怀传 care。
+
+        v1.1.6：支持指定 target（多对象关怀）。不传则用默认对象。
+        """
         if self.in_dnd():
             return False
-        target = self.db.get_default_target()
+        if target is None:
+            target = self.db.get_default_target()
         if not target:
             return False
         # v1.1.5：冷场主动与状态关怀互斥（天气豁免）

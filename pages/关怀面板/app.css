@@ -155,6 +155,7 @@ body {
   background: rgba(124, 108, 240, 0.08); color: var(--muted);
 }
 .tag-primary { background: rgba(124, 108, 240, 0.13); color: var(--primary); }
+.tag-warn { background: rgba(233, 165, 66, 0.12); color: var(--warn, #e9a542); }
 .tag-weather { background: rgba(67, 160, 71, 0.10); color: var(--ok); }
 .tag-state { background: rgba(249, 168, 37, 0.12); color: var(--warn); }
 
@@ -184,6 +185,7 @@ body {
 }
 .form-item input[type="text"]:focus { border-color: rgba(124, 108, 240, 0.5); }
 .form-hint { font-size: 11px; color: var(--muted); line-height: 1.4; }
+.form-warn { font-size: 11px; line-height: 1.4; margin-top: 5px; color: var(--warn); }
 .form-save { margin-top: 12px; align-self: flex-start; }
 
 /* 开关 */
@@ -237,7 +239,7 @@ body {
 .modal-mask[hidden] { display: none !important; }
 .modal {
   background: #ffffff; border: 1px solid var(--panel-border); border-radius: 16px;
-  padding: 24px; width: 340px; box-shadow: 0 20px 60px rgba(45, 42, 62, 0.18);
+  padding: 24px; width: 400px; box-shadow: 0 20px 60px rgba(45, 42, 62, 0.18);
 }
 .modal h3 { margin-bottom: 16px; }
 .modal label { display: block; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
@@ -247,6 +249,14 @@ body {
   color: var(--text); font-size: 13px; outline: none;
 }
 .modal input:focus { border-color: rgba(124, 108, 240, 0.5); }
+.area-cascade { display: flex; gap: 6px; margin-top: 4px; }
+.area-cascade select {
+  flex: 1; min-width: 0; background: rgba(124, 108, 240, 0.05);
+  border: 1px solid var(--panel-border); border-radius: 8px; padding: 8px 6px;
+  color: var(--text); font-size: 12px; outline: none;
+}
+.area-cascade select:focus { border-color: rgba(124, 108, 240, 0.5); }
+#areaCountry { flex: 0 0 62px; }
 .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
 .modal-err { color: var(--danger); font-size: 12px; margin-top: 10px; }
 

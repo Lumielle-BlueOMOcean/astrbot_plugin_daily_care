@@ -308,6 +308,78 @@ class CareDatabase:
         with self._connect() as conn:
             conn.execute("UPDATE care_targets SET location_id=? WHERE id=?", (location_id, target_id))
 
+    def sync_dynamic_location(self, city: str, lat: float, lon: float, region: str = "",
+                              default_target_id: Optional[int] = None) -> int:
+        """v1.1.6：动态定位唯一化 + 默认目标绑定同步。
+
+        保证 locations 表最多一条 type='dynamic' 记录，且默认关怀目标始终指向最新城市：
+        - 默认目标已指向某条动态记录 → 原地 UPDATE（id 稳定，weather_cache 主键不漂移），
+          城市变化时清空该地点的天气缓存（旧城市天气无意义）；
+        - 否则 → 删除全部孤儿动态记录，新建一条并绑定默认目标。
+        返回动态地点 id。
+        """
+        with self._connect() as conn:
+            cur = None
+            if default_target_id:
+                cur = conn.execute(
+                    "SELECT l.id, l.name FROM locations l "
+                    "JOIN care_targets t ON t.location_id=l.id "
+                    "WHERE l.type='dynamic' AND t.id=? LIMIT 1",
+                    (default_target_id,),
+                ).fetchone()
+            if cur:
+                if cur["name"] != city:
+                    conn.execute(
+                        "UPDATE locations SET name=?, lat=?, lon=?, region=? WHERE id=?",
+                        (city, lat, lon, region, cur["id"]),
+                    )
+                    conn.execute("DELETE FROM weather_cache WHERE location_id=?", (cur["id"],))
+                # 清理孤儿动态记录（如旧版 INSERT 出的 Guangzhou 残留）+ 连带其天气缓存
+                for o in conn.execute(
+                    "SELECT id FROM locations WHERE type='dynamic' AND id<>?",
+                    (cur["id"],),
+                ).fetchall():
+                    conn.execute("DELETE FROM weather_cache WHERE location_id=?", (o["id"],))
+                    conn.execute("DELETE FROM locations WHERE id=?", (o["id"],))
+                return cur["id"]
+            # 无被引用的动态记录：清掉全部孤儿，新建并绑定
+            orphan_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM locations WHERE type='dynamic'"
+            ).fetchall()]
+            if orphan_ids:
+                conn.execute("DELETE FROM weather_cache WHERE location_id IN (%s)" % ",".join("?" * len(orphan_ids)), orphan_ids)
+            conn.execute("DELETE FROM locations WHERE type='dynamic'")
+            cur2 = conn.execute(
+                "INSERT INTO locations(name,lat,lon,type,region) VALUES(?,?,?,?,?)",
+                (city, lat, lon, "dynamic", region),
+            )
+            new_id = cur2.lastrowid
+            if default_target_id:
+                conn.execute("UPDATE care_targets SET location_id=? WHERE id=?", (new_id, default_target_id))
+            return new_id
+
+    def cleanup_orphan_dynamic_locations(self) -> int:
+        """v1.1.6：升级自愈——清理未被任何 care_targets 引用的孤儿动态定位记录。
+
+        旧版 webapi 手动定位可能 INSERT 出第二条动态记录但默认目标仍指向旧城市，
+        启动时执行一次，恢复 locations 表唯一动态记录 + 清理其天气缓存。
+        返回清理条数。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM locations WHERE type='dynamic' AND id NOT IN "
+                "(SELECT location_id FROM care_targets WHERE location_id IS NOT NULL)"
+            ).fetchall()
+            for r in rows:
+                conn.execute("DELETE FROM weather_cache WHERE location_id=?", (r["id"],))
+                conn.execute("DELETE FROM locations WHERE id=?", (r["id"],))
+            return len(rows)
+
+    def update_target_user_id(self, target_id: int, user_id: str) -> None:
+        """v1.1.6：回填默认目标的 user_id（旧版本建默认目标时未传 user_id）"""
+        with self._connect() as conn:
+            conn.execute("UPDATE care_targets SET user_id=? WHERE id=?", (user_id, target_id))
+
     # ---------- profile ----------
     def profile_set(self, key: str, value: str) -> None:
         with self._connect() as conn:
