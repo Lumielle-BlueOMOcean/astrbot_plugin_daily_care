@@ -549,7 +549,7 @@ class DailyCarePlugin(Star):
                     self.config.save_config()
             except Exception:
                 pass
-            logger.info(f"[DailyCare] 已自动捕获关怀对象 QQ: {uid}")
+            logger.info(f"[DailyCare] 已自动捕获关怀对象 QQ: {uid}（注意：自动捕获依赖消息事件分发，可能不稳定，建议在 WebUI 手动填写 QQ 号数字，无需填写 umo）")
         except Exception as e:
             logger.debug(f"[DailyCare] 自动捕获失败(可忽略): {e}")
 
