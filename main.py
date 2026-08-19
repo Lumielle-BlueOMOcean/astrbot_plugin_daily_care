@@ -36,7 +36,7 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 
-@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.7")
+@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.6")
 class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -90,43 +90,6 @@ class DailyCarePlugin(Star):
 
     # ---------- 生命周期 ----------
     async def initialize(self):
-        # v1.1.7：handler 注册自检——重启即可确认消息事件入口是否挂上。
-        # 覆盖三件事：star_map 能否命中本插件（activated 状态）、AdapterMessageEvent
-        # handler 是否注册成功、事件类型是否为 AdapterMessageEvent。
-        try:
-            from astrbot.core.star.star_handler import EventType, star_handlers_registry
-            from astrbot.core.star.star import star_map
-
-            mod = self.__class__.__module__
-            meta = star_map.get(mod)
-            if meta is not None:
-                logger.info(
-                    f"[DailyCare] 自检：star_map 命中 module_path={mod} name={meta.name} "
-                    f"activated={meta.activated}"
-                )
-            else:
-                logger.error(
-                    f"[DailyCare] 自检失败：star_map 中找不到本插件（module_path={mod}），"
-                    f"消息事件将不会被分发到本插件"
-                )
-            msg_handlers = [
-                h
-                for h in star_handlers_registry.get_handlers_by_module_name(mod)
-                if h.event_type == EventType.AdapterMessageEvent
-            ]
-            if msg_handlers:
-                logger.info(
-                    f"[DailyCare] 自检：AdapterMessageEvent handler 已注册 "
-                    f"{len(msg_handlers)} 个 -> {[h.handler_name for h in msg_handlers]}"
-                )
-            else:
-                logger.error(
-                    "[DailyCare] 自检失败：AdapterMessageEvent handler 未注册，"
-                    "消息事件无法进入插件"
-                )
-        except Exception as e:
-            logger.warning(f"[DailyCare] 自检不可用（不影响插件运行）: {e}")
-
         default_uid = str(self._cfg("target_user_id", "") or "").strip().split(",")[0].strip()
         self.umo = self._default_session()
         self.persona_prompt = await self._load_persona()
@@ -542,14 +505,12 @@ class DailyCarePlugin(Star):
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_private_message(self, event: AstrMessageEvent):
         uid = str(getattr(event.message_obj.sender, "user_id", "") or "")
-        logger.info(f"[DailyCare] 消息事件到达插件：私聊 uid={uid} session={event.unified_msg_origin}")
         self._auto_capture_user(uid)
         await self._monitor_event(event)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
         uid = str(getattr(event.message_obj.sender, "user_id", "") or "")
-        logger.info(f"[DailyCare] 消息事件到达插件：群聊 uid={uid} session={event.unified_msg_origin}")
         target_uid = str(self._cfg("target_user_id", "") or "").strip()
         if target_uid and uid not in target_uid.split(","):
             return
