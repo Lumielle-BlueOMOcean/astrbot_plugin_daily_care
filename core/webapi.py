@@ -40,6 +40,7 @@ class CareWebAPI:
         register = self.plugin.context.register_web_api
         routes = [
             ("/overview", self.get_overview, ["GET"], "Daily Care overview"),
+            ("/platforms", self.list_platforms, ["GET"], "Daily Care platform list"),
             ("/targets", self.list_targets, ["GET"], "Daily Care targets"),
             ("/targets/add", self.add_target, ["POST"], "Daily Care add target"),
             ("/targets/delete", self.delete_target, ["POST"], "Daily Care delete target"),
@@ -89,6 +90,35 @@ class CareWebAPI:
 
     def _err(self, msg: str) -> dict:
         return {"code": 1, "status": "error", "message": msg, "data": None}
+
+    # ---------- 平台实例 ----------
+    async def list_platforms(self, params: dict = None) -> dict:
+        """返回当前已注册的平台实例列表及 UMO 解析诊断（v1.1.7）。
+
+        供 WebUI「关怀对象」区下拉手动配置 UMO / platform_id 使用：
+        - instances: 已注册平台实例 id（跳过 webchat）
+        - configured: 当前配置的 platform_id
+        - resolved: 当前动态解析结果（空表示未解析到）
+        - session: 当前默认会话 UMO
+        """
+        try:
+            ctx = self.plugin.context
+            pm = getattr(ctx, "platform_manager", None)
+            insts = []
+            if pm is not None:
+                for inst in getattr(pm, "platform_insts", None) or []:
+                    pid = (getattr(inst, "config", None) or {}).get("id", "")
+                    if pid and pid != "webchat":
+                        insts.append(pid)
+        except Exception as e:
+            logger.warning(f"[DailyCare] 获取平台实例列表失败: {e}")
+            insts = []
+        return self._ok({
+            "instances": insts,
+            "configured": self._cfg("platform_id", "auto"),
+            "resolved": self.plugin._dynamic_platform_id() if hasattr(self.plugin, "_dynamic_platform_id") else "",
+            "session": self.plugin.umo or "",
+        })
 
     # ---------- 总览 ----------
     async def get_overview(self, params: dict = None) -> dict:

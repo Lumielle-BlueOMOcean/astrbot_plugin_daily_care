@@ -240,6 +240,95 @@ def test_dnd():
     print("✓ 勿扰时段测试通过")
 
 
+def test_platform_id_v117():
+    """v1.1.7：平台实例解析 8 场景。
+
+    显式配置优先 / 动态解析(跳过webchat) / 无实例返空 / TTL缓存不重解析 /
+    失败计数提示 / 解析失败不拼幽灵会话 / 正常拼接 / 不再锁死旧 session 前缀。
+    """
+    from core.executor import Executor
+    from core import executor as executor_mod
+    import unittest.mock as mock
+
+    class FakeInst:
+        def __init__(self, pid):
+            self.config = {"id": pid}
+
+    class FakePM:
+        def __init__(self, insts):
+            self.platform_insts = insts
+
+    class FakeCtx:
+        def __init__(self, insts):
+            self.platform_manager = FakePM(insts)
+
+    class FailPM:
+        @property
+        def platform_insts(self):
+            raise Exception("no platform registered")
+
+    class FailCtx:
+        platform_manager = FailPM()
+
+    class CountingPM:
+        def __init__(self):
+            self.calls = 0
+
+        @property
+        def platform_insts(self):
+            self.calls += 1
+            return [FakeInst("Atri 3")]
+
+    class CountingCtx:
+        def __init__(self):
+            self.platform_manager = CountingPM()
+
+    db = make_db()
+
+    # 1. 显式配置优先
+    ex = Executor(db, {"platform_id": "Atri 3"}, FakeCtx([FakeInst("Atri 3")]), None)
+    assert ex._platform_id() == "Atri 3", ex._platform_id()
+
+    # 2. 动态解析：auto 从已注册实例解析，跳过 webchat
+    ex = Executor(db, {"platform_id": "auto"}, FakeCtx([FakeInst("Atri 3"), FakeInst("webchat")]), None)
+    assert ex._platform_id() == "Atri 3", ex._platform_id()
+
+    # 3. 无实例 → 返回空
+    ex = Executor(db, {"platform_id": "auto"}, FakeCtx([]), None)
+    assert ex._platform_id() == "", ex._platform_id()
+
+    # 4. TTL 缓存：60s 内第二次不重新解析
+    ex = Executor(db, {"platform_id": "auto"}, CountingCtx(), None)
+    assert ex._platform_id() == "Atri 3"
+    assert ex._platform_id() == "Atri 3"
+    assert ex.context.platform_manager.calls == 1, "TTL 缓存命中，不应重复解析"
+
+    # 5. 失败计数：连续 3 次后日志提示手动配置
+    warns = []
+    with mock.patch.object(executor_mod.logger, "warning",
+                           side_effect=lambda *a, **k: warns.append(a[0])):
+        ex = Executor(db, {"platform_id": "auto"}, FailCtx(), None)
+        for _ in range(3):
+            assert ex._platform_id() == ""
+        assert ex._pid_fail_count >= 3, "应累计失败次数"
+        assert any("手动" in w or "WebUI" in w for w in warns), "应提示手动配置 UMO"
+
+    # 6. 解析失败不拼幽灵会话
+    ex = Executor(db, {"platform_id": "auto"}, FailCtx(), None)
+    assert ex._target_session({"user_id": "2603822050"}) == "", ex._target_session({})
+
+    # 7. 正常拼接
+    ex = Executor(db, {"platform_id": "Atri 3"}, FakeCtx([]), None)
+    assert ex._target_session({"user_id": "2603822050"}) == "Atri 3:FriendMessage:2603822050"
+
+    # 8. 不再锁死旧 session 前缀：平台变化后用动态解析的新实例
+    ex = Executor(db, {"platform_id": "auto"}, FakeCtx([FakeInst("Atri 3")]), None,
+                  session="Lumielle:FriendMessage:2603822050")
+    assert ex._target_session({"user_id": "2603822050"}) == "Atri 3:FriendMessage:2603822050"
+
+    print("✓ v1.1.7 平台实例解析 8 场景测试通过")
+
+
 
 def test_recovery_signal():
     """recovery 恢复信号：根据用户"好了/退了"自动关闭状态事件（v5.6.1）"""
@@ -1156,6 +1245,7 @@ if __name__ == "__main__":
     test_executor_background_and_send()
     test_executor_cooldown_and_limit()
     test_dnd()
+    test_platform_id_v117()
     test_recovery_signal()
     test_recovery_llm_semantic_resolve()
     test_recovery_llm_resolve_conservative()

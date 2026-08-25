@@ -36,7 +36,7 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 
-@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.6")
+@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.7")
 class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -203,10 +203,11 @@ class DailyCarePlugin(Star):
 
     # ---------- 会话 ----------
     def _dynamic_platform_id(self) -> str:
-        """动态解析真实平台实例 ID（v1.1.6：修复亚托莉机器上唤醒失败）。
+        """动态解析真实平台实例 ID。
 
-        优先级：显式配置 platform_id（非 auto）> 已注册平台实例 > 兜底 Lumielle。
-        不再硬编码，避免实例名不同的机器（如 Atri 3）上会话不匹配。
+        优先级：显式配置 platform_id（非 auto）> 已注册平台实例 > 空。
+        v1.1.7：不再兜底 "Lumielle"——对其他用户该实例不存在，兜底只会拼出
+        幽灵会话导致唤醒找不到平台。解析失败返回空，由调用方决定是否提示。
         """
         pid = str(self._cfg("platform_id", "") or "").strip()
         if pid and pid != "auto":
@@ -221,7 +222,7 @@ class DailyCarePlugin(Star):
                         return pid
         except Exception as e:
             logger.warning(f"[DailyCare] 动态解析平台实例失败: {e}")
-        return "Lumielle"
+        return ""
 
     def _default_session(self) -> str:
         uid = str(self._cfg("target_user_id", "") or "").strip()
@@ -229,6 +230,8 @@ class DailyCarePlugin(Star):
         if not uid:
             return ""
         pid = self._dynamic_platform_id()
+        if not pid:
+            return ""
         return f"{pid}:FriendMessage:{uid}"
 
     # ---------- LLM 调用（支持独立配置决策 LLM）----------

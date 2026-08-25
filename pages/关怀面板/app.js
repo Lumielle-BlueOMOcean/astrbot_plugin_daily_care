@@ -2,6 +2,7 @@
 // API 端点（相对于 /api/plug/astrbot_plugin_daily_care/ 的路径）
 const API = {
   overview: "page/overview",
+  platforms: "page/platforms",
   targets: "page/targets",
   addTarget: "page/targets/add",
   deleteTarget: "page/targets/delete",
@@ -112,13 +113,17 @@ const FORM_META = {
     ["dnd_start", "勿扰开始", "23:00", "勿扰开始时间", "time"],
     ["dnd_end", "勿扰结束", "08:00", "勿扰结束时间", "time"],
     ["timezone", "时区", "Asia/Shanghai", "天气接口时区"],
-    ["platform_id", "平台实例ID", "auto", "auto 自动解析；多实例时手动指定"],
   ],
   targets: [
     ["target_user_id", "我的QQ", "", "默认关怀对象；留空则收到首条消息后自动捕获"],
     ["target_city", "我的城市", "", "优先使用；留空则自动IP定位"],
+    ["platform_id", "平台实例ID(UMO)", "auto", "auto 自动解析；解析失败时才需手动指定，如 Atri 3", "select"],
   ],
 };
+
+// v1.1.7：已注册平台实例列表（供 UMO 下拉选择）
+let PLATFORM_INSTS = [];
+let UMO_DIAG = null;
 
 function buildForm(containerId, meta, values) {
   const wrap = document.getElementById(containerId);
@@ -135,6 +140,16 @@ function buildForm(containerId, meta, values) {
       input = `<div class="range-wrap"><input type="range" min="1" max="10" step="1" data-key="${key}" value="${esc(String(val))}" /><span class="range-val" data-range="${key}">${esc(String(val))}</span></div>`;
     } else if (type === "time") {
       input = `<input type="time" data-key="${key}" value="${esc(String(val))}" />`;
+    } else if (type === "select") {
+      // 单一 select：auto + 已注册实例；若当前值不在列表（手动填过）则追加为额外选项
+      const insts = (PLATFORM_INSTS || []).slice();
+      if (val && val !== "auto" && insts.indexOf(String(val)) < 0) {
+        insts.unshift(String(val));
+      }
+      const opts = [`<option value="auto">auto（自动解析）</option>`].concat(
+        insts.map((p) => `<option value="${esc(p)}" ${String(val) === p ? "selected" : ""}>${esc(p)}</option>`)
+      ).join("");
+      input = `<select data-key="${key}">${opts}</select>`;
     } else if (type === "window-multi") {
       const wins = parseWindows(val);
       const presets = [
@@ -515,6 +530,14 @@ function setText(id, v) {
 async function load() {
   const badge = document.getElementById("personaBadge");
   try {
+    // v1.1.7：先拉取已注册平台实例列表，供 UMO 下拉使用
+    try {
+      const pd = await api(API.platforms);
+      if (pd && pd.code === 0 && pd.data) {
+        PLATFORM_INSTS = pd.data.instances || [];
+        UMO_DIAG = pd.data;
+      }
+    } catch (e) {}
     const data = await api(API.overview);
     if (data.code !== 0) throw new Error(data.message);
     const ov = data.data || {};
@@ -525,6 +548,8 @@ async function load() {
     buildForm("stateSettings", FORM_META.state, cfg);
     buildForm("proactiveSettings", FORM_META.proactive, cfg);
     buildForm("globalSettings", FORM_META.global, cfg);
+    buildForm("targetsSettings", FORM_META.targets, cfg);
+    renderUmoDiag();
     badge.classList.remove("error");
     setText("personaBadge", "已连接");
   } catch (e) {
@@ -538,6 +563,50 @@ async function load() {
   try { renderSends((await api(API.sends)).data || []); } catch (e) {}
   try { renderLocations((await api(API.locations)).data || []); } catch (e) {}
   try { renderDecisions((await api(API.decisions)).data || []); } catch (e) {}
+}
+
+// v1.1.7：UMO 解析诊断条——自动解析结果 / 当前会话，失败时引导手动配置
+function renderUmoDiag() {
+  const el = document.getElementById("umoDiag");
+  if (!el) return;
+  if (!UMO_DIAG) {
+    el.innerHTML = "";
+    el.classList.remove("diag-ok", "diag-warn");
+    return;
+  }
+  const { instances, configured, resolved, session } = UMO_DIAG;
+  if (configured && configured !== "auto") {
+    el.classList.add("diag-ok");
+    el.classList.remove("diag-warn");
+    el.innerHTML = `✅ 已手动指定平台实例 <b>${esc(configured)}</b>，当前会话：<code>${esc(session || "-")}</code>`;
+  } else if (resolved) {
+    el.classList.add("diag-ok");
+    el.classList.remove("diag-warn");
+    el.innerHTML = `✅ 已自动解析到平台实例 <b>${esc(resolved)}</b>，当前会话：<code>${esc(session || "-")}</code>`;
+  } else {
+    el.classList.add("diag-warn");
+    el.classList.remove("diag-ok");
+    const opts = (instances || []).map((p) => `<option value="${esc(p)}">${esc(p)}</option>`).join("");
+    el.innerHTML = `⚠️ 未解析到平台实例，定时唤醒将暂时停用。可在此手动选择：` +
+      `<select id="umoManual" class="umo-manual"><option value="">请选择…</option>${opts}</select>` +
+      ` <button class="btn btn-primary btn-sm" id="umoManualBtn">应用</button>` +
+      `<span class="diag-hint">QQ 号与 UMO 理论上可自动捕获，仅失败时才需手动配置</span>`;
+    const btn = document.getElementById("umoManualBtn");
+    if (btn) {
+      btn.addEventListener("click", async () => {
+        const sel = document.getElementById("umoManual");
+        const v = sel && sel.value;
+        if (!v) { showAction("请先选择平台实例"); return; }
+        try {
+          const r = await api(API.settings, "POST", { platform_id: v });
+          showAction(r.data?.message || r.message || "已保存");
+          load();
+        } catch (err) {
+          showAction("保存失败：" + (err?.message || err));
+        }
+      });
+    }
+  }
 }
 
 // ---------- 事件绑定 ----------

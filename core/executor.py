@@ -45,6 +45,10 @@ class Executor:
         self.persona_prompt = persona_prompt or ""
         self.session = session        # 默认发送会话（unified_msg_origin）
         self.wake_channel = WakeChannel(context, config)
+        # v1.1.7：平台实例动态解析缓存与失败计数（不再锁死、不再兜底）
+        self._pid_cache = ""
+        self._pid_cache_ts = 0.0
+        self._pid_fail_count = 0
 
     # ---------- 时间判定 ----------
     def in_dnd(self) -> bool:
@@ -66,15 +70,26 @@ class Executor:
         if not uid:
             return self.session or ""
         platform_id = self._platform_id()
+        if not platform_id:
+            # v1.1.7：解析失败不拼幽灵会话，返回空由上层放弃本次唤醒
+            return ""
         return f"{platform_id}:FriendMessage:{uid}"
 
     def _platform_id(self) -> str:
+        """解析平台实例 ID。
+
+        优先级：显式配置 platform_id（非 auto）> 已注册平台实例（TTL 缓存）。
+        v1.1.7：
+        - 不再硬编码兜底 "Lumielle"（对其他用户该实例不存在，兜底反而埋雷）。
+        - 不再锁死初始化时的 session 前缀：动态解析失败会定期重试，而非永久沿用旧值。
+        - 连续失败时在日志中提示用户在 WebUI 手动配置 UMO。
+        """
         pid = str(self.config.get("platform_id", "") or "").strip()
         if pid and pid != "auto":
             return pid
-        if self.session and ":" in self.session:
-            return self.session.split(":")[0]
-        # v1.1.6：动态从已注册平台实例获取真实 platform_id（不硬编码 Lumielle）
+        now = time.time()
+        if self._pid_cache and now - self._pid_cache_ts < 60:
+            return self._pid_cache
         try:
             pm = getattr(self.context, "platform_manager", None)
             if pm is not None:
@@ -82,10 +97,22 @@ class Executor:
                 for inst in insts:
                     pid = (getattr(inst, "config", None) or {}).get("id", "")
                     if pid and pid != "webchat":
+                        self._pid_cache = pid
+                        self._pid_cache_ts = now
+                        self._pid_fail_count = 0
                         return pid
         except Exception as e:
             logger.warning(f"[DailyCare] 动态解析平台实例失败: {e}")
-        return "Lumielle"
+        # 解析失败：清空缓存以便尽快重试，并计数提示手动配置
+        self._pid_cache = ""
+        self._pid_fail_count += 1
+        if self._pid_fail_count >= 3 and self._pid_fail_count % 3 == 0:
+            logger.warning(
+                f"[DailyCare] 已连续 {self._pid_fail_count} 次动态解析平台实例失败，"
+                "定时唤醒暂时停用。请在 WebUI「关怀对象」区手动填写 UMO / 平台实例 ID，"
+                "或确认平台实例已注册后重启 AstrBot。"
+            )
+        return ""
 
     # ---------- 会话上下文（仅反思读取历史用，不参与直发）----------
     async def _load_session_context(self, session: str) -> tuple[str, list]:
@@ -145,6 +172,11 @@ class Executor:
             if not background:
                 self.db.mark_plan(plan["id"], "skipped")
                 continue
+            # v1.1.7（补丁）：计划背景创建于凌晨/深夜，其中的时间描述可能已过期。
+            # 注入当前真实时间，避免 LLM 把旧时间当作「此刻」（曾导致早上 8 点的
+            # 问候写成「凌晨三点多了」）。当前时间显式覆盖，旧背景仅作内容参考。
+            _now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+            background = f"{background}\n（附注：以上背景写于更早时刻；当前实际时间：{_now_str}，请以当前时间为准。）"
             # v1.1.5：计划关怀(care)与冷场主动互斥——窗口内另一类刚发过则跳过
             if self._mutex_blocked("care", target["id"]):
                 logger.info("[DailyCare] 计划关怀与冷场主动互斥，跳过本次")

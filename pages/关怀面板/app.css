@@ -307,3 +307,30 @@ body {
   border-radius: 8px; padding: 6px 10px; color: var(--text); font-size: 12px; outline: none;
 }
 .win-add input:focus { border-color: rgba(124,108,240,0.5); }
+
+
+/* ---------- v1.1.7：UMO 诊断条 ---------- */
+.umo-diag {
+  margin-top: 12px; padding: 10px 14px; border-radius: 10px;
+  font-size: 12.5px; line-height: 1.7;
+  border: 1px solid var(--panel-border);
+  background: rgba(124,108,240,0.05);
+}
+.umo-diag.diag-ok { border-color: rgba(94,186,125,0.35); background: rgba(94,186,125,0.07); color: #4caf7d; }
+.umo-diag.diag-warn { border-color: rgba(229,115,115,0.4); background: rgba(229,115,115,0.07); color: #e57373; }
+.umo-diag code {
+  background: rgba(0,0,0,0.18); padding: 1px 6px; border-radius: 5px; font-size: 12px;
+}
+.umo-diag .umo-manual {
+  margin: 0 6px; padding: 4px 8px; border-radius: 7px;
+  background: rgba(0,0,0,0.2); color: var(--text); border: 1px solid var(--panel-border); outline: none;
+}
+.umo-diag .diag-hint {
+  display: block; margin-top: 5px; font-size: 11.5px; opacity: 0.75;
+}
+.form-item select {
+  background: rgba(124,108,240,0.06); border: 1px solid var(--panel-border);
+  border-radius: 8px; padding: 7px 10px; color: var(--text); font-size: 12.5px; outline: none;
+  appearance: auto;
+}
+.form-item select:focus { border-color: rgba(124,108,240,0.5); }
