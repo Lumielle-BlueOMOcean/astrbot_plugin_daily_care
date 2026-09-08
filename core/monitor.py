@@ -369,6 +369,17 @@ class CareMonitor:
         self.db.kv_set("last_user_msg_ts", now)
         self.db.kv_set("last_activity_ts", now)
 
+    def record_bot_message(self, ts: Optional[int] = None) -> None:
+        """记录 bot 被动回复时间（由 main 的消息入口识别 bot 自身消息时调用）。
+
+        v1.1.8：对话活跃期保护——bot 正常回复（非主动开口）也算「任何一方
+        交流」，同步刷新 last_activity_ts。这样只要对话在流动（无论谁发言），
+        静默就不会累积，冷场主动与固定检查点都不会在热聊中误触发。
+        注意：不更新 last_user_msg_ts（用户静默时长仍以用户发言为准）。
+        """
+        now = int(ts or time.time())
+        self.db.kv_set("last_activity_ts", now)
+
     def silence_minutes(self) -> int:
         """当前已静默的分钟数（以最后任何一方交流为基准）。"""
         last = self.db.kv_get("last_activity_ts", 0)

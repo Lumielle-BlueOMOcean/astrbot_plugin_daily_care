@@ -181,6 +181,9 @@ class DecisionEngine:
         # 静默时长（冷场主动消息用）
         last_user = self.db.kv_get("last_user_msg_ts", 0)
         silence_min = int((time.time() - last_user) / 60) if last_user else 0
+        # v1.1.8 对话活跃度（任何一方交流，含 bot 被动回复）
+        last_act = self.db.kv_get("last_activity_ts", 0)
+        active_min = int((time.time() - last_act) / 60) if last_act else 999
         return {
             "events": ev_lines,
             "weather_count": len(weather_events),
@@ -194,6 +197,7 @@ class DecisionEngine:
             "now": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "window": window_of_now() or "无",
             "silence_minutes": silence_min,
+            "active_minutes": active_min,
             "daily_note_windows": daily_note_windows,
             "in_note_window": _in_note_window(datetime.now(), daily_note_windows),
             "target_name": target.get("name", "你"),
@@ -221,6 +225,10 @@ class DecisionEngine:
             "7. 拿不准时倾向 silent（宁缺毋滥）。\n"
             "7b. 关怀积极度（1-10，越高越主动）：积极度 >= 7 时，理由一般也可以考虑 act；"
             "积极度 <= 3 时，除非有极端情况（恶劣天气/明显不适），否则倾向 silent。\n"
+            "7c. 【对话活跃期保护·强制】若『最近双方交流』信息存在且距离现在不足 30 分钟"
+            "（即对话正在热络进行中），说明用户此刻正在和你聊天——除非有极端紧急情况"
+            "（如暴雨/雷电/台风/用户明显不适），否则必须输出 silent，绝不在聊天中插入主动关怀。"
+            "『最近双方交流』含 bot 自己的正常回复，只要对话在流动就视为活跃期。\n"
             "8. 若『对话已静默』信息存在且静默时间较长（≥120分钟）、今日开口不多，"
             "可以考虑 act——这是主动开启话题的自然契机，background 写客观事实如"
             "'我们有一阵子没说话了'；但若静默时间过短（<60分钟）不要 act，避免打扰。\n"
@@ -257,6 +265,8 @@ class DecisionEngine:
             user_lines.append("⚠️ 本次为保底触发：静默已达最大窗口，必须开口。")
         if ctx.get("silence_minutes"):
             user_lines.append(f"对话已静默 {ctx['silence_minutes']} 分钟（若值得可以主动开启话题）")
+        if ctx.get("active_minutes") is not None:
+            user_lines.append(f"最近双方交流：{ctx['active_minutes']} 分钟前（含 bot 正常回复；若 <30 分钟表示对话正在活跃期，除极端情况外不要打扰）")
         if ctx["events"]:
             user_lines.append("感知到的事件：\n" + "\n".join(ctx["events"]))
         else:

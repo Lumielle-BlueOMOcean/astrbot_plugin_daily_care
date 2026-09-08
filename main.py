@@ -36,7 +36,7 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 
-@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.7")
+@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.8")
 class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -491,7 +491,13 @@ class DailyCarePlugin(Star):
                 "# 关于你此刻的状态\n"
                 "你心里忽然泛起一丝惦记，想要主动开口对用户说点什么。"
                 "这不是对话的回应，而是你自己内心自然涌起的关心。\n"
-                f"你此刻感知到的环境信息（把它当作你自己知道的事实）：\n{bg}"
+                f"你此刻感知到的环境信息（把它当作你自己知道的事实）：\n{bg}\n"
+                "\n"
+                "# 输出边界（主动开口时必须遵守）\n"
+                "你只输出你真正想对用户说的那句话本身，就像平时和用户聊天一样自然。"
+                "严禁输出任何内部状态说明、执行记录、系统提示、工作日志、"
+                "对自身机制的描述，也不要用括号写旁白。"
+                "那些内容永远不会出现在你发给用户的话里。"
             )
             parts = getattr(request, "extra_user_content_parts", None)
             if parts is not None:
@@ -509,6 +515,13 @@ class DailyCarePlugin(Star):
     async def on_private_message(self, event: AstrMessageEvent):
         uid = str(getattr(event.message_obj.sender, "user_id", "") or "")
         self._auto_capture_user(uid)
+        # v1.1.8 对话活跃期保护：bot 自身的被动回复也算交流，刷新活跃基准
+        try:
+            if event.get_self_id() and event.get_self_id() == event.get_sender_id():
+                self.monitor.record_bot_message()
+                return
+        except Exception:
+            pass
         await self._monitor_event(event)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -518,6 +531,13 @@ class DailyCarePlugin(Star):
         if target_uid and uid not in target_uid.split(","):
             return
         self._auto_capture_user(uid)
+        # v1.1.8 对话活跃期保护：bot 自身的被动回复也算交流，刷新活跃基准
+        try:
+            if event.get_self_id() and event.get_self_id() == event.get_sender_id():
+                self.monitor.record_bot_message()
+                return
+        except Exception:
+            pass
         await self._monitor_event(event, reflect=False)
 
     def _auto_capture_user(self, uid: str) -> None:
