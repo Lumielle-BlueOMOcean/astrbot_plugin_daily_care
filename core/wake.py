@@ -45,19 +45,106 @@ def _build_daily_care_wake_event(cron_event_cls):
     """
 
     class DailyCareWakeEvent(cron_event_cls):
-        async def send(self, message) -> None:
-            if message is None:
-                self.set_extra("daily_care_platform_sent", False)
+        def _clear_result(self) -> None:
+            try:
+                make_result = getattr(self, "make_result", None)
+                set_result = getattr(self, "set_result", None)
+                if callable(make_result) and callable(set_result):
+                    set_result(make_result())
+                    return
+                result = self.get_result() if callable(getattr(self, "get_result", None)) else None
+                if result is not None and hasattr(result, "chain"):
+                    result.chain = []
+            except Exception as exc:
+                logger.warning(
+                    f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
+                    f"清理拒绝发送结果失败: {exc}"
+                )
+
+        def _reject_transport(self, reason: str) -> None:
+            # A successful delivery is final. A later framework/plugin call
+            # must not downgrade it or clear the already-authorized body.
+            if (
+                self.get_extra("daily_care_platform_sent") is True
+                or self.get_extra("daily_care_transport_consumed") is True
+            ):
+                logger.warning(
+                    f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
+                    f"重复/未授权发送已抑制（已完成 transport）: {reason}"
+                )
                 return
+
+            self.set_extra("daily_care_platform_sent", False)
+            self.set_extra("daily_care_outcome", "invalid")
+            self.set_extra("daily_care_delivered_text", "")
+            self._clear_result()
+            logger.warning(
+                f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
+                f"未授权 transport 已抑制: {reason}"
+            )
+
+        @staticmethod
+        def _is_exact_authorized_message(message, outcome, delivered) -> tuple[bool, str]:
+            if outcome != "send":
+                return False, "outcome is not send"
+            if not isinstance(delivered, str) or not delivered:
+                return False, "delivered text is empty or not text"
+            try:
+                from astrbot.core.message.components import Plain
+                from astrbot.core.message.message_event_result import MessageChain
+            except Exception:
+                return False, "AstrBot MessageChain API unavailable"
+            if not isinstance(message, MessageChain):
+                return False, "message is not a MessageChain"
+            chain = getattr(message, "chain", None)
+            if not isinstance(chain, list) or len(chain) != 1:
+                return False, "message chain must contain exactly one component"
+            component = chain[0]
+            if not isinstance(component, Plain):
+                return False, "message chain contains a non-Plain component"
+            if not isinstance(component.text, str) or component.text != delivered:
+                return False, "message text does not exactly match delivered text"
+            return True, ""
+
+        async def send(self, message) -> None:
+            if self.get_extra("daily_care_finalized") is True:
+                logger.warning(
+                    f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
+                    "已完成生命周期的 transport 已抑制"
+                )
+                return
+            if (
+                self.get_extra("daily_care_platform_sent") is True
+                or self.get_extra("daily_care_transport_consumed") is True
+            ):
+                logger.warning(
+                    f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
+                    "重复 transport 已抑制"
+                )
+                return
+
+            valid, reason = self._is_exact_authorized_message(
+                message,
+                self.get_extra("daily_care_outcome"),
+                self.get_extra("daily_care_delivered_text"),
+            )
+            if not valid:
+                self._reject_transport(reason)
+                return
+
             try:
                 sent = await self.context_obj.send_message(self.session, message)
             except Exception:
                 self.set_extra("daily_care_platform_sent", False)
+                self.set_extra("daily_care_outcome", "invalid")
+                self.set_extra("daily_care_delivered_text", "")
+                self._clear_result()
                 raise
 
             platform_sent = sent is True
             self.set_extra("daily_care_platform_sent", platform_sent)
             if platform_sent:
+                self.set_extra("daily_care_transport_consumed", True)
                 # CronMessageEvent.send() would call Context.send_message a
                 # second time. Jump directly to AstrMessageEvent's bookkeeping
                 # implementation so _has_send_oper remains an implementation

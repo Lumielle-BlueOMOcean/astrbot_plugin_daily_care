@@ -37,7 +37,7 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 
-@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.10")
+@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.11")
 class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -623,16 +623,32 @@ class DailyCarePlugin(Star):
     @filter.after_message_sent()
     async def _after_message_sent_care_wake(self, event: AstrMessageEvent):
         care = self._care_wake_info(event)
-        if care is None or event.get_extra("daily_care_outcome") != "send":
+        if care is None:
+            return
+        if event.get_extra("daily_care_finalized"):
             return
         if event.get_extra("daily_care_committed"):
             return
+
+        outcome = event.get_extra("daily_care_outcome")
+        if outcome not in ("send", "silent", "invalid"):
+            outcome = "invalid"
+            event.set_extra("daily_care_outcome", outcome)
+            event.set_extra("daily_care_delivered_text", "")
+
+        if outcome in ("silent", "invalid"):
+            await self._mark_wake_skipped(event, care)
+            event.set_extra("daily_care_finalized", True)
+            return
+
         if event.get_extra("daily_care_platform_sent") is not True:
             await self._mark_wake_skipped(event, care)
+            event.set_extra("daily_care_finalized", True)
             return
         delivered = str(event.get_extra("daily_care_delivered_text") or "")
         if not delivered:
             await self._mark_wake_skipped(event, care)
+            event.set_extra("daily_care_finalized", True)
             return
 
         if not event.get_extra("daily_care_history_commit_attempted"):
@@ -652,6 +668,7 @@ class DailyCarePlugin(Star):
         # Set the idempotency guard before any state mutation. AstrBot calls
         # this hook only once in normal operation; the flag protects retries.
         event.set_extra("daily_care_committed", True)
+        event.set_extra("daily_care_finalized", True)
         target_id = int(care.get("target_id") or 0)
         channel = str(care.get("channel") or "care")
         plan_id = int(care.get("plan_id") or 0)

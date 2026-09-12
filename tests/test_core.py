@@ -171,6 +171,19 @@ def test_wake_event_contract():
             self.extra_user_content_parts = []
             self.prompt = ""
 
+    class CorePlain:
+        def __init__(self, text): self.text = text
+
+    class CoreOtherComponent:
+        pass
+
+    class CoreMessageChain:
+        def __init__(self, chain=None): self.chain = list(chain or [])
+        def __str__(self): return "".join(getattr(part, "text", "") for part in self.chain)
+
+    class CoreMessageEventResult(CoreMessageChain):
+        pass
+
     class Session:
         platform_id = "TestPlatform"
         message_type = "FriendMessage"
@@ -189,6 +202,7 @@ def test_wake_event_contract():
             self.__dict__.update(kwargs)
             self._extras = kwargs.get("extras", {}).copy()
             self._has_send_oper = False
+            self._result = None
 
         def get_extra(self, key, default=None):
             return self._extras.get(key, default)
@@ -196,12 +210,24 @@ def test_wake_event_contract():
         def set_extra(self, key, value):
             self._extras[key] = value
 
+        def make_result(self):
+            return CoreMessageEventResult()
+
+        def set_result(self, result):
+            self._result = result
+
+        def get_result(self):
+            return self._result
+
     fake_modules = {
         "astrbot.core": _types.ModuleType("astrbot.core"),
         "astrbot.core.agent": _types.ModuleType("astrbot.core.agent"),
         "astrbot.core.agent.message": _types.ModuleType("astrbot.core.agent.message"),
         "astrbot.core.cron": _types.ModuleType("astrbot.core.cron"),
         "astrbot.core.cron.events": _types.ModuleType("astrbot.core.cron.events"),
+        "astrbot.core.message": _types.ModuleType("astrbot.core.message"),
+        "astrbot.core.message.components": _types.ModuleType("astrbot.core.message.components"),
+        "astrbot.core.message.message_event_result": _types.ModuleType("astrbot.core.message.message_event_result"),
         "astrbot.core.platform": _types.ModuleType("astrbot.core.platform"),
         "astrbot.core.platform.astr_message_event": _types.ModuleType("astrbot.core.platform.astr_message_event"),
         "astrbot.core.platform.message_session": _types.ModuleType("astrbot.core.platform.message_session"),
@@ -210,6 +236,9 @@ def test_wake_event_contract():
     }
     fake_modules["astrbot.core.agent.message"].TextPart = TempTextPart
     fake_modules["astrbot.core.cron.events"].CronMessageEvent = Event
+    fake_modules["astrbot.core.message.components"].Plain = CorePlain
+    fake_modules["astrbot.core.message.message_event_result"].MessageChain = CoreMessageChain
+    fake_modules["astrbot.core.message.message_event_result"].MessageEventResult = CoreMessageEventResult
     fake_modules["astrbot.core.platform.astr_message_event"].AstrMessageEvent = AstrMessageEvent
     fake_modules["astrbot.core.platform.message_session"].MessageSession = Session
     fake_modules["astrbot.core.provider.entities"].ProviderRequest = ProviderRequest
@@ -260,33 +289,96 @@ def test_wake_event_contract():
             ctx.send_calls += 1
             return ctx.send_result
         ctx.send_message = send_message
-        asyncio.run(event.send("body"))
+        event.set_extra("daily_care_outcome", "send")
+        event.set_extra("daily_care_delivered_text", "body")
+        asyncio.run(event.send(CoreMessageChain([CorePlain("body")])))
         assert event.get_extra("daily_care_platform_sent") is True
+        assert event.get_extra("daily_care_transport_consumed") is True
         assert event._has_send_oper is True
         assert ctx.send_calls == 1
+        asyncio.run(event.send(CoreMessageChain([CorePlain("body")])))
+        assert ctx.send_calls == 1
+        assert event.get_extra("daily_care_platform_sent") is True
+
+        assert asyncio.run(WakeChannel(ctx, {}).wake(
+            "TestPlatform:FriendMessage:42", "天气事实", channel="weather", wake_source="weather"
+        ))[0] is True
         event_false = ctx.queue.items.pop()
         event_false.context_obj = ctx
         event_false.session = Session()
         event_false._has_send_oper = True
+        event_false.set_extra("daily_care_outcome", "send")
+        event_false.set_extra("daily_care_delivered_text", "body")
         ctx.send_result = False
-        asyncio.run(event_false.send("body"))
+        asyncio.run(event_false.send(CoreMessageChain([CorePlain("body")])))
         assert event_false.get_extra("daily_care_platform_sent") is False
         assert event_false._has_send_oper is True
         assert ctx.send_calls == 2
-        event_error = ctx.queue.items[0] if ctx.queue.items else event
-        event_error.context_obj = ctx
-        event_error.session = Session()
+
+        # 未经过 protocol 授权的框架错误不能触达平台，也不能留下原始 result。
+        unauthorized = type(event)(
+            context=ctx,
+            session=Session(),
+            extras={"daily_care": {"kind": "wake", "wake_id": "unauthorized"}},
+        )
+        unauthorized.context_obj = ctx
+        unauthorized.session = Session()
+        unauthorized.set_extra("daily_care_outcome", None)
+        unauthorized.set_extra("daily_care_delivered_text", "")
+        ctx.send_result = True
+        asyncio.run(unauthorized.send(CoreMessageChain([CorePlain("Error occurred while processing agent request: test")])))
+        assert ctx.send_calls == 2
+        assert unauthorized.get_extra("daily_care_platform_sent") is False
+        assert unauthorized.get_extra("daily_care_outcome") == "invalid"
+        assert unauthorized.get_extra("daily_care_delivered_text") == ""
+        assert unauthorized.get_result().chain == []
+
+        # SILENT/INVALID 以及正文不匹配、额外组件都必须拒绝。
+        for outcome, delivered, outgoing in (
+            ("silent", "", [CorePlain("任何内容")]),
+            ("invalid", "", [CorePlain("任何内容")]),
+            ("send", "午饭吃了吗？", [CorePlain("晚饭吃了吗？")]),
+            ("send", "午饭吃了吗？", [CorePlain("午饭吃了吗？"), CorePlain("内部状态")]),
+            ("send", "午饭吃了吗？", [CoreOtherComponent()]),
+        ):
+            blocked = type(event)(
+                context=ctx,
+                session=Session(),
+                extras={"daily_care": {"kind": "wake", "wake_id": "blocked"}},
+            )
+            blocked.context_obj = ctx
+            blocked.session = Session()
+            blocked.set_extra("daily_care_outcome", outcome)
+            blocked.set_extra("daily_care_delivered_text", delivered)
+            before = ctx.send_calls
+            asyncio.run(blocked.send(CoreMessageChain(outgoing)))
+            assert ctx.send_calls == before
+            assert blocked.get_extra("daily_care_platform_sent") is False
+            assert blocked.get_extra("daily_care_outcome") == "invalid"
+            assert blocked.get_result().chain == []
+
+        # Context.send_message 抛错时不产生成功标记。
+        exception_event = type(event)(
+            context=ctx,
+            session=Session(),
+            extras={"daily_care": {"kind": "wake", "wake_id": "exception"}},
+        )
+        exception_event.context_obj = ctx
+        exception_event.session = Session()
+        exception_event.set_extra("daily_care_outcome", "send")
+        exception_event.set_extra("daily_care_delivered_text", "body")
         async def raise_send(session, chain):
             ctx.send_calls += 1
             raise RuntimeError("platform unavailable")
         ctx.send_message = raise_send
         try:
-            asyncio.run(event_error.send("body"))
+            asyncio.run(exception_event.send(CoreMessageChain([CorePlain("body")])))
         except RuntimeError:
             pass
         else:
             raise AssertionError("platform exception must propagate")
-        assert event_error.get_extra("daily_care_platform_sent") is False
+        assert exception_event.get_extra("daily_care_platform_sent") is False
+        assert exception_event.get_extra("daily_care_transport_consumed") is not True
         assert asyncio.run(WakeChannel(ctx, {}).wake(
             "TestPlatform:FriendMessage:42", "", channel="care"
         )) == (False, "")
@@ -505,6 +597,34 @@ def test_main_wake_hooks_and_scope():
         assert bad_event.get_extra("daily_care_outcome") == "invalid"
         asyncio.run(plugin._on_decorating_result_care_wake(bad_event))
         assert bad_event.get_result().chain == []
+
+        # 任何非 SEND 的 wake 结果都必须收敛 processing 计划，不得永久挂起。
+        today = datetime.now().strftime("%Y-%m-%d")
+        for outcome in (None, "silent", "invalid"):
+            plan_event_id = db.add_event(target_id, "state", f"计划-{outcome}", "详情", ttl_hours=72)
+            plan_id = db.add_plan(plan_event_id, target_id, today, "morning", "care", "计划事实")
+            assert db.mark_plan(plan_id, "processing") is True
+            plan_care = {**care, "plan_id": plan_id, "wake_id": f"finalizer-{outcome}"}
+            plan_event = Event(plan_care)
+            if outcome is not None:
+                plan_event.set_extra("daily_care_outcome", outcome)
+            asyncio.run(plugin._after_message_sent_care_wake(plan_event))
+            with db._connect() as conn:
+                status = conn.execute("SELECT status FROM care_plans WHERE id=?", (plan_id,)).fetchone()[0]
+            assert status == "skipped", (outcome, status)
+            assert plan_event.get_extra("daily_care_outcome") in ("silent", "invalid")
+
+        false_event_id = db.add_event(target_id, "state", "平台不存在计划", "详情", ttl_hours=72)
+        false_plan_id = db.add_plan(false_event_id, target_id, today, "noon", "care", "平台事实")
+        assert db.mark_plan(false_plan_id, "processing") is True
+        false_plan_event = Event({**care, "plan_id": false_plan_id, "wake_id": "finalizer-false"})
+        false_plan_event.set_extra("daily_care_outcome", "send")
+        false_plan_event.set_extra("daily_care_delivered_text", "不会发送")
+        false_plan_event.set_extra("daily_care_platform_sent", False)
+        asyncio.run(plugin._after_message_sent_care_wake(false_plan_event))
+        with db._connect() as conn:
+            status = conn.execute("SELECT status FROM care_plans WHERE id=?", (false_plan_id,)).fetchone()[0]
+        assert status == "skipped"
 
         class Request:
             def __init__(self): self.func_tool = "ordinary-tools"
