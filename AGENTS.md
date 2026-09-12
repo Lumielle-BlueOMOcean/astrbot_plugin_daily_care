@@ -33,6 +33,28 @@ tests/test_core.py      单元测试（不依赖 astrbot 运行时）
 - **动态化 + 成本控制**：在成本可控的前提下多用 LLM；算法（关键词粗筛、规则层变化检测）只做兜底和成本控制，结论永远由 LLM 下。
 - **事件生命周期**：写入按 (type, cause) 归因去重 → 恢复按病因精确关闭 → 天气按日期维度合并 → 过期自动清理 → 地点切换失效。信息无孤儿（seen 方案）、事件无堆积、恢复不误伤。
 
+## ChatGPT + Codex Workflow
+
+GitHub repository state is the shared source of truth.
+
+When Codex receives an implementation task:
+
+1. Treat the current repository code as authoritative.
+2. Read the task first, then inspect only the files directly relevant to it.
+3. If ChatGPT Sol has already specified the architecture, implementation approach, relevant files, API behavior, data structures, constraints, and acceptance criteria, treat that as the approved implementation specification unless it conflicts with the actual repository.
+4. Do not unnecessarily redesign an already-defined solution or perform unrelated refactors.
+5. Expand investigation only when necessary, and keep changes focused and reasonably small.
+6. If the requested implementation conflicts with the real code, dependencies, architecture, security constraints, or tests, report the conflict instead of silently replacing the design.
+7. After modifications, run all checks relevant to the change: tests, typecheck, lint, build, or project-specific verification.
+8. At completion briefly report files changed, implementation, verification actually run and results, and remaining risks or unresolved issues.
+
+The intended division of work is:
+
+- ChatGPT Sol: analysis, architecture, debugging reasoning, and code review.
+- Codex: implementation, command execution, testing, and verification.
+
+Do not sacrifice correctness merely to reduce reasoning or token usage.
+
 ## 开发约定
 
 - 修改配置项必须同步 `_conf_schema.json`（WebUI 唯一来源），hint ≤ 25 字。

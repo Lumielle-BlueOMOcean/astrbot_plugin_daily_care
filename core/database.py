@@ -89,7 +89,7 @@ class CareDatabase:
                     trigger_window TEXT NOT NULL,  -- morning/noon/evening/night
                     task_type TEXT DEFAULT 'reminder', -- reminder陈述 / inquiry询问
                     content_summary TEXT DEFAULT '',
-                    status TEXT DEFAULT 'pending', -- pending / sent / skipped / cancelled
+                    status TEXT DEFAULT 'pending', -- pending / processing / sent / skipped / cancelled
                     trigger_ts INTEGER DEFAULT 0,   -- 窗口内随机触发时刻（0=未定）
                     sent_at INTEGER DEFAULT 0,
                     created_at INTEGER NOT NULL
@@ -535,7 +535,7 @@ class CareDatabase:
             # 同事件同日期同窗口去重
             row = conn.execute(
                 "SELECT id FROM care_plans WHERE event_id=? AND plan_date=? AND trigger_window=? "
-                "AND status IN ('pending','sent')",
+                "AND status IN ('pending','processing','sent')",
                 (event_id, plan_date, trigger_window),
             ).fetchone()
             if row:
@@ -563,20 +563,49 @@ class CareDatabase:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def mark_plan(self, plan_id: int, status: str) -> None:
+    def mark_plan(self, plan_id: int, status: str) -> bool:
+        """Advance a plan state and report whether this transition happened.
+
+        ``processing`` is claimed only from ``pending`` and ``sent`` is
+        committed only from ``processing``.  This keeps queueing separate from
+        actual platform delivery and makes duplicate confirmations harmless.
+        """
+        valid = {"pending", "processing", "sent", "skipped", "cancelled"}
+        if status not in valid:
+            raise ValueError(f"invalid plan status: {status}")
         with self._connect() as conn:
-            if status == "sent":
-                conn.execute(
-                    "UPDATE care_plans SET status=?, sent_at=? WHERE id=?",
+            if status == "processing":
+                cur = conn.execute(
+                    "UPDATE care_plans SET status=? WHERE id=? AND status='pending'",
+                    (status, plan_id),
+                )
+            elif status == "sent":
+                cur = conn.execute(
+                    "UPDATE care_plans SET status=?, sent_at=? "
+                    "WHERE id=? AND status='processing'",
                     (status, int(time.time()), plan_id),
                 )
             else:
-                conn.execute("UPDATE care_plans SET status=? WHERE id=?", (status, plan_id))
+                cur = conn.execute(
+                    "UPDATE care_plans SET status=? WHERE id=? "
+                    "AND status IN ('pending','processing')",
+                    (status, plan_id),
+                )
+            return cur.rowcount > 0
+
+    def recover_processing_plans(self) -> int:
+        """Return plans left in ``processing`` to the queue after a restart."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE care_plans SET status='pending' WHERE status='processing'"
+            )
+            return cur.rowcount
 
     def cancel_plans_by_event(self, event_id: int) -> None:
         with self._connect() as conn:
             conn.execute(
-                "UPDATE care_plans SET status='cancelled' WHERE event_id=? AND status='pending'",
+                "UPDATE care_plans SET status='cancelled' WHERE event_id=? "
+                "AND status IN ('pending','processing')",
                 (event_id,),
             )
 

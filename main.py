@@ -31,12 +31,13 @@ from .core.monitor import CareMonitor
 from .core.reflection import ChatReflector, WeatherJudge
 from .core.weather_tool import WeatherTool
 from .core.webapi import CareWebAPI
+from .core.wake_protocol import parse_wake_output
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 
-@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.8")
+@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.9")
 class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -90,6 +91,9 @@ class DailyCarePlugin(Star):
 
     # ---------- 生命周期 ----------
     async def initialize(self):
+        recovered = self.db.recover_processing_plans()
+        if recovered:
+            logger.info(f"[DailyCare] 启动恢复遗留 processing 计划 {recovered} 条为 pending")
         default_uid = str(self._cfg("target_user_id", "") or "").strip().split(",")[0].strip()
         self.umo = self._default_session()
         self.persona_prompt = await self._load_persona()
@@ -357,23 +361,26 @@ class DailyCarePlugin(Star):
         """对单个关怀对象执行一次决策并落地。返回 decision 值。"""
         result = await self._decision.decide(target, source=source, guarantee=guarantee)
         if not result:
-            # 保底触发时 LLM 失败也不能静默放弃：直接尝试开口
+            # 保底触发时 LLM 失败也不能静默放弃，但这里只能唤醒真实
+            # Main Agent；绝不在插件侧生成一句替代话术。
             if guarantee:
-                logger.warning("[DailyCare] 保底触发但决策 LLM 失败，按 act 兜底")
-                bg = "我们有一阵子没说话了，有点惦记你"
-                # v1.1.1：保底兜底直接开口。开口成功会重置静默基准
-                # （last_activity_ts），静默需重新攒够 min_silence 才有下一轮
-                # 资格，间隔由静默语义承载，无需单独冷却。
-                ok = await self._executor.execute_immediate(bg, channel="proactive")
-                if ok:
-                    logger.info("[DailyCare] 保底兜底已开口")
-                    return "act"
-                return "act_blocked"
+                logger.warning("[DailyCare] 保底触发但决策 LLM 失败，唤醒 Main Agent 自主决定")
+                result = {
+                    "decision": "act",
+                    "background": "",
+                    "wake_facts": "",
+                    "focus_event_ids": [],
+                    "category": "proactive",
+                    "reason": "guarantee_decision_unavailable",
+                }
+            else:
+                return "silent"
+        if not result:
             return "silent"
         decision = result.get("decision")
         if decision == "act":
-            bg = result.get("background") or ""
-            if bg:
+            wake_facts = result.get("wake_facts") or ""
+            if wake_facts or result.get("category") == "proactive" or source == "proactive":
                 # v1.00 冷却分轨 + v1.1.1 修订：
                 # - 主动消息（source=proactive）不再需要独立冷却——进入前静默
                 #   已满足 min_silence，且开口成功会重置静默基准，两次主动的
@@ -385,7 +392,7 @@ class DailyCarePlugin(Star):
                     channel = "weather"
                     cooldown_min = int(self._cfg("weather_cooldown_hours", 6)) * 60
                     last_key = f"last_weather_send_{target['id']}"
-                elif source == "proactive":
+                elif source == "proactive" or cat == "proactive":
                     channel = "proactive"
                     cooldown_min = 0
                     last_key = ""
@@ -398,10 +405,16 @@ class DailyCarePlugin(Star):
                     if (time.time() - last) < cooldown_min * 60:
                         logger.info(f"[DailyCare] {channel} 决策被冷却拦截（距上次{channel}开口过近）")
                         return "act_cooled"
-                ok = await self._executor.execute_immediate(bg, channel=channel, target=target)
+                ok = await self._executor.execute_immediate(
+                    wake_facts,
+                    channel=channel,
+                    target=target,
+                    wake_source=source,
+                )
                 if ok:
-                    logger.info(f"[DailyCare] 已按决策立即开口: {bg[:40]}...")
+                    logger.info("[DailyCare] 主动唤醒已入队，等待 Main Agent 自主决定是否开口")
                     return "act"
+                return "act_blocked"
         elif decision == "plan":
             self._decision.apply_plan(target, result)
             return "plan"
@@ -451,64 +464,141 @@ class DailyCarePlugin(Star):
             except Exception as e:
                 logger.warning(f"[DailyCare] 冷场主动异常: {e}")
 
-    # ---------- 环境感知注入（v4.1 / v5.1）----------
+    # ---------- Daily Care wake 安全边界 ----------
     @filter.on_llm_request(priority=60)
     async def _on_llm_request_care_wake(self, event: AstrMessageEvent, request):
-        """当事件是我们推入的关怀唤醒事件时，把环境认知注入给 bot 本人。
-
-        v5.2 关键改进：唤醒消息不再携带背景文本（message 为空），
-        背景只通过 extras 传递。主 agent 收到的是空消息，不会误以为
-        是用户在说话，也不会在对话流/历史里留下插件内部信息。
-        这里在 LLM 请求进入主 agent 之前，声明：你没有收到任何消息，
-        是你自己心里泛起念头想开口了——这正是"主动关怀"的自然形态。
-
-        注入走 extra_user_content_parts（不碰 system_prompt，保护 LLM 前缀缓存）。
-        """
+        """Restrict only Daily Care wakes to the two-state action space."""
         try:
             care = event.get_extra("daily_care")
-            if not care or not isinstance(care, dict):
+            if not isinstance(care, dict) or care.get("kind") != "wake":
                 return
-            if care.get("kind") != "wake":
-                return
-            # v5.2：WakeChannel 已在 ProviderRequest.extra_user_content_parts 预填
-            # 环境感知（injected=True），这里不再重复注入，避免重复文本。
-            if care.get("injected"):
-                # 关键清理：build_main_agent 在空 prompt+有附加内容时会把
-                # req.prompt 强设为字面量 "<attachment>"，它会被 assemble_context
-                # 原样作为用户消息发给 LLM，产生怪异感。这里清掉它：
-                # prompt="" 时 assemble_context 不会添加用户发言块，
-                # LLM 只看到 extra_user_content_parts 里的环境感知文本。
-                try:
-                    if getattr(request, "prompt", None) == "<attachment>":
-                        request.prompt = ""
-                except Exception:
-                    pass
-                return
-            bg = str(care.get("background") or "").strip()
-            if not bg:
-                return
-            note = (
-                "# 关于你此刻的状态\n"
-                "你心里忽然泛起一丝惦记，想要主动开口对用户说点什么。"
-                "这不是对话的回应，而是你自己内心自然涌起的关心。\n"
-                f"你此刻感知到的环境信息（把它当作你自己知道的事实）：\n{bg}\n"
-                "\n"
-                "# 输出边界（主动开口时必须遵守）\n"
-                "你只输出你真正想对用户说的那句话本身，就像平时和用户聊天一样自然。"
-                "严禁输出任何内部状态说明、执行记录、系统提示、工作日志、"
-                "对自身机制的描述，也不要用括号写旁白。"
-                "那些内容永远不会出现在你发给用户的话里。"
-            )
-            parts = getattr(request, "extra_user_content_parts", None)
-            if parts is not None:
-                from astrbot.core.agent.message import TextPart
-                parts.append(TextPart(text=note))
-                logger.info("[DailyCare] 已注入环境感知（无痕唤醒：不携带消息，不碰 system_prompt）")
-            elif hasattr(request, "system_prompt"):
-                request.system_prompt = str(request.system_prompt or "") + "\n\n" + note
-                logger.info("[DailyCare] 已向 system_prompt 注入环境感知（旧版兼容路径）")
+            request.func_tool = None
+            event.set_extra("daily_care_tools_disabled", True)
+            # AstrBot 4.25.5 may expose the attachment sentinel after
+            # assembling the provider request. It is not a real user turn.
+            if getattr(request, "prompt", None) == "<attachment>":
+                request.prompt = ""
         except Exception as e:
-            logger.debug(f"[DailyCare] 环境感知注入失败(可忽略): {e}")
+            logger.warning(f"[DailyCare] wake request safety setup failed: {e}")
+
+    @staticmethod
+    def _care_wake_info(event):
+        care = event.get_extra("daily_care")
+        if not isinstance(care, dict) or care.get("kind") != "wake":
+            return None
+        return care
+
+    @staticmethod
+    def _mark_temp_wake_user(run_context) -> None:
+        """Mark the synthetic provider-facing user turn as non-persistent."""
+        last_user = None
+        for message in reversed(getattr(run_context, "messages", []) or []):
+            if getattr(message, "role", "") != "user":
+                continue
+            last_user = message
+            content = getattr(message, "content", None)
+            parts = content if isinstance(content, list) else []
+            if any(getattr(part, "_no_save", False) for part in parts):
+                message._no_save = True
+                return
+        # Message.model_validate() may not preserve the content part's private
+        # _no_save flag. For a Daily Care wake the last user turn is always
+        # the synthetic provider-facing turn, so mark that exact turn too.
+        if last_user is not None:
+            last_user._no_save = True
+
+    @staticmethod
+    def _set_final_assistant_message(run_context, text: str, no_save: bool) -> None:
+        from astrbot.core.agent.message import TextPart
+
+        for message in reversed(getattr(run_context, "messages", []) or []):
+            if getattr(message, "role", "") == "assistant":
+                message.content = [] if no_save else [TextPart(text=text)]
+                message._no_save = no_save
+                return
+
+    async def _mark_wake_skipped(self, event, care: dict) -> None:
+        plan_id = int(care.get("plan_id") or 0)
+        if plan_id:
+            self.db.mark_plan(plan_id, "skipped")
+
+    @filter.on_agent_done()
+    async def _on_agent_done_care_wake(self, event: AstrMessageEvent, run_context, response):
+        care = self._care_wake_info(event)
+        if care is None:
+            return
+        wake_id = str(care.get("wake_id") or "")
+        raw = getattr(response, "completion_text", "") if response is not None else ""
+        output = parse_wake_output(raw or "")
+        self._mark_temp_wake_user(run_context)
+
+        if output is not None and output.action == "send":
+            response.result_chain = None
+            response.completion_text = output.message
+            self._set_final_assistant_message(run_context, output.message, no_save=False)
+            event.set_extra("daily_care_outcome", "send")
+            event.set_extra("daily_care_delivered_text", output.message)
+            event.set_extra("daily_care_committed", False)
+            return
+
+        outcome = "silent" if output is not None else "invalid"
+        if outcome == "invalid":
+            logger.warning(
+                f"[DailyCare] wake_id={wake_id} Main Agent 输出未通过 wake protocol，按 silent 处理"
+            )
+        if response is not None:
+            response.result_chain = None
+            response.completion_text = ""
+        self._set_final_assistant_message(run_context, "", no_save=True)
+        event.set_extra("daily_care_outcome", outcome)
+        event.set_extra("daily_care_delivered_text", "")
+        await self._mark_wake_skipped(event, care)
+
+    @filter.on_decorating_result()
+    async def _on_decorating_result_care_wake(self, event: AstrMessageEvent):
+        care = self._care_wake_info(event)
+        if care is None:
+            return
+        outcome = event.get_extra("daily_care_outcome")
+        result = event.get_result()
+        if result is None:
+            return
+        if outcome == "send":
+            from astrbot.api.message_components import Plain
+            result.chain = [Plain(str(event.get_extra("daily_care_delivered_text") or ""))]
+        else:
+            if outcome not in ("silent", "invalid"):
+                event.set_extra("daily_care_outcome", "invalid")
+                await self._mark_wake_skipped(event, care)
+            result.chain = []
+
+    @filter.after_message_sent()
+    async def _after_message_sent_care_wake(self, event: AstrMessageEvent):
+        care = self._care_wake_info(event)
+        if care is None or event.get_extra("daily_care_outcome") != "send":
+            return
+        if event.get_extra("daily_care_committed"):
+            return
+        if not getattr(event, "_has_send_oper", False):
+            await self._mark_wake_skipped(event, care)
+            return
+        delivered = str(event.get_extra("daily_care_delivered_text") or "")
+        if not delivered:
+            await self._mark_wake_skipped(event, care)
+            return
+        # Set the idempotency guard before any state mutation. AstrBot calls
+        # this hook only once in normal operation; the flag protects retries.
+        event.set_extra("daily_care_committed", True)
+        target_id = int(care.get("target_id") or 0)
+        channel = str(care.get("channel") or "care")
+        plan_id = int(care.get("plan_id") or 0)
+        now = int(time.time())
+        self.db.add_send_log(target_id, plan_id, delivered, channel)
+        self.db.kv_set(self._executor._last_send_key(target_id, channel), now)
+        self.db.kv_set("last_activity_ts", now)
+        if plan_id:
+            self.db.mark_plan(plan_id, "sent")
+        logger.info(f"[DailyCare] Main Agent 主动消息已实际发送（wake_id={care.get('wake_id', '')}）")
 
     # ---------- 聊天入口 ----------
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)

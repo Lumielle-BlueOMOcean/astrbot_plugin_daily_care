@@ -4,20 +4,16 @@
 把"唤醒 bot 本人"这条唯一的非官方内部路径关进笼子。
 
 v5.2 关键改进（修复用户反馈的三个问题）：
-问题1「插件内部信息先出现」根因：背景文本被塞进 CronMessageEvent.message，
-被当作"用户消息"显示成 Scheduler 消息、写进对话历史。
-修复：message 留空（不显示、不进对话流），背景只通过 extras 传递。
+问题1「插件内部信息先出现」根因：运行时提示曾被当作普通用户消息处理。
+修复：message 留空，认知提示只作为临时 ProviderRequest 内容，不显示、不进对话流。
 
 问题2「关怀消息突兀」根因：主 agent 把背景当成"用户在说话"，开口带孤立感。
-修复：环境感知文本预填进 ProviderRequest.extra_user_content_parts，声明
-"你没收到任何消息，是你自己心里泛起念头想开口"——自然的主动关怀形态。
+修复：环境感知文本预填进 ProviderRequest.extra_user_content_parts，并标记为临时认知。
 
 v5.3 改进（用户指出唤醒消息未延续上下文）：
 问题「有连续性但没延续话题」根因：注入文本把开口动机完全绑定在环境背景上，
 会话历史虽已加载但只提供"记忆"，不驱动"说什么"。
-修复：注入文本重构为两个维度——① 为什么开口（心里泛起惦记，来自环境背景，
-不再声明"没收到消息"，消除与真实历史的矛盾）；② 说什么（从会话历史提炼最近
-话题脉络并入注入，自然接续你们正在聊的内容）。
+修复：注入文本明确这是一次主动唤醒，并把真实会话历史交给 Main Agent 自行决定如何回应。
 
 无痕唤醒的实现要点（读 AstrBot 源码确认）：
 - internal.py 的 process：has_valid_message=False 时若 has_provider_request=True
@@ -34,6 +30,7 @@ v5.3 改进（用户指出唤醒消息未延续上下文）：
 - AstrBot 升级时，本文件是唯一需要检查/修复的点。
 """
 import json
+import uuid
 from typing import Optional
 
 from astrbot.api import logger
@@ -99,18 +96,23 @@ class WakeChannel:
         except Exception:
             return ""
 
-    async def wake(self, session_str: str, background: str,
-                   with_topic: bool = True) -> tuple[bool, str]:
-        """无痕唤醒 bot 本人。返回 (是否成功, 背景文本)。
+    async def wake(self, session_str: str, wake_facts: str,
+                   with_topic: bool = True, *, target_id: int = 0,
+                   channel: str = "care", plan_id: int = 0,
+                   wake_source: str = "") -> tuple[bool, str]:
+        """无痕唤醒 bot 本人。返回 ``(是否入队成功, wake_id)``。
 
         session_str: 目标会话的 unified_msg_origin（如 平台实例:消息类型:用户ID）
-        background:  客观背景事实（作为"自己记得的事"注入给 bot 本人感知，
-                     不进入会话显示，不进入对话流）
+        wake_facts:  从当前 active events 确定性构造的客观事实；主动冷场
+                     唤醒可以为空，不能携带 DecisionEngine 的控制上下文
         with_topic:  是否注入最近话题脉络。有具体背景的唤醒（天气/状态关怀）
                      背景本身就是开口理由，不需要话题接续；仅冷场主动需要。
         """
-        if not session_str or not background:
+        if not session_str:
             return False, ""
+        if not wake_facts and channel != "proactive" and wake_source != "proactive":
+            return False, ""
+        wake_id = uuid.uuid4().hex
         try:
             from astrbot.core.agent.message import TextPart
             from astrbot.core.cron.events import CronMessageEvent
@@ -147,15 +149,16 @@ class WakeChannel:
             except Exception as e:
                 logger.warning(f"[DailyCare] 加载会话历史失败(将无历史唤醒): {e}")
 
-            # v5.3 注入文本重构：两个维度
-            # 维度一「为什么开口」：心里忽然泛起惦记，来自环境背景（不声明"没收到消息"，
-            #   避免与真实历史冲突）；维度二「说什么」：自然延续最近话题，把惦记融进去。
+            # 本轮提示是临时认知：真实历史和其他插件上下文仍由 Main Agent
+            # 正常管线提供，Daily Care 只追加本轮事实与协议边界。
             why_lines = [
-                "# 关于你此刻的状态",
-                "你心里忽然泛起一丝惦记，想要主动开口对用户说点什么。",
-                "这不是在回应谁，而是你自己内心自然涌起的关心。",
-                "你此刻心里装着这些（当作你自己记得的事实，不必提及它们的来源）：",
-                background,
+                "这是一次主动唤醒，本轮没有新的用户输入。",
+                "你仍然是当前主对话中的你自己。",
+                "结合当前人格、真实会话历史、长期记忆以及其他插件为你提供的当前状态，",
+                "自行决定现在是否真的想主动对用户说话。",
+                "",
+                "本轮可感知的客观事实：",
+                wake_facts or "（本轮没有额外客观事实。）",
             ]
             if recent_topic:
                 why_lines += [
@@ -163,18 +166,29 @@ class WakeChannel:
                     "最近你们聊到的话题（作为你记得的上下文，自然地接续它）：",
                     recent_topic,
                 ]
+            why_lines += [
+                "",
+                "如果想说话，message 中只写真正要对用户说的话。",
+                "如果此刻不想打扰用户，则选择 silent。",
+                '只输出完整 JSON：{"action":"send","message":"..."} 或 {"action":"silent","message":""}。',
+                "不要输出 markdown、解释文字、内部状态或其他字段。",
+            ]
             note = "\n".join(why_lines)
-            req.extra_user_content_parts.append(TextPart(text=note))
+            req.extra_user_content_parts.append(TextPart(text=note).mark_as_temp())
 
             care_event = CronMessageEvent(
                 context=self.context,
                 session=session,
                 message="",
                 extras={
+                    "enable_streaming": False,
                     "daily_care": {
-                        "background": background,
                         "kind": "wake",
-                        "injected": True,
+                        "wake_id": wake_id,
+                        "target_id": int(target_id or 0),
+                        "channel": channel,
+                        "plan_id": int(plan_id or 0),
+                        "wake_source": wake_source or channel,
                     },
                     "provider_request": req,
                 },
@@ -182,9 +196,9 @@ class WakeChannel:
             )
             await self.context.get_event_queue().put(care_event)
             logger.info(
-                f"[DailyCare] 无痕唤醒事件已推入总线（背景不显示、不进对话流，由 bot 本人开口）"
+                f"[DailyCare] 主动唤醒已入队，等待 Main Agent 自主决定是否开口（wake_id={wake_id}）"
             )
-            return True, background
+            return True, wake_id
         except Exception as e:
             logger.error(f"[DailyCare] 无痕唤醒事件推入失败: {e}")
             return False, ""

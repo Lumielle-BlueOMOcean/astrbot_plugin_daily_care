@@ -149,7 +149,7 @@ class Executor:
         today = datetime.now().strftime("%Y-%m-%d")
         now_ts = int(time.time())
         plans = self.db.get_pending_plans(today)
-        sent = []
+        queued = []
         for plan in plans:
             # v1.1.6：计划按各自 target 发送（多对象关怀），默认对象作为兜底
             target = self.db.get_target(plan.get("target_id") or 0) or self.db.get_default_target()
@@ -168,34 +168,45 @@ class Executor:
                     due = True
             if not due:
                 continue
-            background = plan.get("content_summary") or ""
-            if not background:
+            wake_facts = plan.get("content_summary") or ""
+            is_proactive = plan.get("task_type") == "proactive"
+            if not wake_facts and not is_proactive:
                 self.db.mark_plan(plan["id"], "skipped")
                 continue
             # v1.1.7（补丁）：计划背景创建于凌晨/深夜，其中的时间描述可能已过期。
             # 注入当前真实时间，避免 LLM 把旧时间当作「此刻」（曾导致早上 8 点的
             # 问候写成「凌晨三点多了」）。当前时间显式覆盖，旧背景仅作内容参考。
             _now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-            background = f"{background}\n（附注：以上背景写于更早时刻；当前实际时间：{_now_str}，请以当前时间为准。）"
+            if wake_facts:
+                wake_facts = f"{wake_facts}\n（附注：以上事实写于更早时刻；当前实际时间：{_now_str}，请以当前时间为准。）"
             # v1.1.5：计划关怀(care)与冷场主动互斥——窗口内另一类刚发过则跳过
-            if self._mutex_blocked("care", target["id"]):
+            channel = "proactive" if is_proactive else "care"
+            if self._mutex_blocked(channel, target["id"]):
                 logger.info("[DailyCare] 计划关怀与冷场主动互斥，跳过本次")
                 self.db.mark_plan(plan["id"], "skipped")
                 continue
-            ok, _ = await self._woke_for_care(target, background, with_topic=False)
+            if not self.db.mark_plan(plan["id"], "processing"):
+                continue
+            try:
+                ok, wake_id = await self._woke_for_care(
+                    target,
+                    wake_facts,
+                    with_topic=is_proactive,
+                    channel=channel,
+                    plan_id=plan["id"],
+                    wake_source="proactive" if is_proactive else "plan",
+                )
+            except Exception as e:
+                logger.warning(f"[DailyCare] 计划唤醒入队异常，跳过本次: {e}")
+                ok, wake_id = False, ""
             if ok:
-                self.db.mark_plan(plan["id"], "sent")
-                # 记录发送日志（以背景代表"提醒过这件事"，供防重复）
-                self.db.add_send_log(target["id"], plan["id"], background[:500], "care")
-                self.db.kv_set(f"last_care_send_{target['id']}", int(time.time()))
-                self.db.kv_set("last_activity_ts", int(time.time()))  # v1.1.1：主动开口也算交流，重置静默
-                sent.append(background)
-                logger.info(f"[DailyCare] 计划已执行（随机时刻 {datetime.fromtimestamp(trigger_ts).strftime('%H:%M') if trigger_ts else '窗口' }）")
+                queued.append(wake_id)
+                logger.info(f"[DailyCare] 计划主动唤醒已入队，等待 Main Agent 决定是否发送（随机时刻 {datetime.fromtimestamp(trigger_ts).strftime('%H:%M') if trigger_ts else '窗口' }，wake_id={wake_id}）")
             else:
                 # 唤醒失败：放弃本次，不降级直发
-                logger.warning(f"[DailyCare] 计划唤醒失败，放弃本次（不降级直发）: {background[:30]}...")
+                logger.warning(f"[DailyCare] 计划唤醒失败，放弃本次（不降级直发）: {wake_facts[:30]}...")
                 self.db.mark_plan(plan["id"], "skipped")
-        return sent
+        return queued
 
     @staticmethod
     def _last_send_key(target_id: int, channel: str) -> str:
@@ -211,7 +222,7 @@ class Executor:
         （如「我们有一阵子没说话了」「已有 N 分钟没有对话」），同一沉默时段两类
         几乎同时命中时会连发两条同类消息。此处在发送前做互斥：silence_exclude_window_min
         分钟内，另一类刚发过则本次直接放弃（决策层已各按自身冷却判断过，这里只做
-        跨板块互斥）。天气(weather)含客观信息量（下雨/降温/预警），不参与互斥。
+        跨板块互斥）。天气(weather)含客观信息量，不参与互斥。
         """
         if channel not in ("proactive", "care"):
             return False
@@ -224,7 +235,9 @@ class Executor:
             return False
         return (time.time() - last) < win * 60
 
-    async def execute_immediate(self, background: str, channel: str = "care", target: Optional[dict] = None) -> bool:
+    async def execute_immediate(self, wake_facts: str, channel: str = "care",
+                                target: Optional[dict] = None, *, plan_id: int = 0,
+                                wake_source: str = "") -> bool:
         """决策为 act 时立即唤醒开口。channel 区分来源：主动消息传 proactive，关怀传 care。
 
         v1.1.6：支持指定 target（多对象关怀）。不传则用默认对象。
@@ -239,12 +252,18 @@ class Executor:
         if self._mutex_blocked(channel, target["id"]):
             logger.info(f"[DailyCare] {channel} 与另一沉默类板块互斥，放弃本次")
             return False
-        ok, _ = await self._woke_for_care(target, background, with_topic=(channel == "proactive"))
+        ok, wake_id = await self._woke_for_care(
+            target,
+            wake_facts,
+            with_topic=(channel == "proactive"),
+            channel=channel,
+            plan_id=plan_id,
+            wake_source=wake_source or channel,
+        )
         if ok:
-            self.db.add_send_log(target["id"], 0, background[:500], channel)
-            # 冷却分轨：按 channel 记录各自最后发送时间
-            self.db.kv_set(self._last_send_key(target["id"], channel), int(time.time()))
-            self.db.kv_set("last_activity_ts", int(time.time()))  # v1.1.1：主动开口也算交流，重置静默
+            logger.info(
+                f"[DailyCare] 主动唤醒已入队，等待 Main Agent 自主决定是否开口（wake_id={wake_id}）"
+            )
             return True
         logger.warning("[DailyCare] 立即开口唤醒失败，放弃本次（不降级直发）")
         return False
@@ -270,29 +289,30 @@ class Executor:
         return "\n".join(lines)
 
     # ---------- 测试入口 ----------
-    async def test_send(self, background: str = "") -> list[str]:
+    async def test_send(self, wake_facts: str = "") -> list[str]:
         """测试：立即基于活跃事件唤醒一次开口。"""
         target = self.db.get_default_target()
         if not target:
             return []
-        if not background:
+        if not wake_facts:
             events = self.db.get_active_events(target["id"])
             if not events:
                 return []
-            background = self._compose_background(target, events)
-        if not background:
+            wake_facts = self._compose_background(target, events)
+        if not wake_facts:
             return []
-        ok, _ = await self._woke_for_care(target, background, with_topic=False)
+        ok, wake_id = await self._woke_for_care(
+            target, wake_facts, with_topic=False,
+            channel="test", wake_source="manual_test",
+        )
         if ok:
-            self.db.add_send_log(target["id"], 0, background[:500], "test")
-            self.db.kv_set(f"last_care_send_{target['id']}", int(time.time()))
-            self.db.kv_set("last_activity_ts", int(time.time()))  # v1.1.1：主动开口也算交流，重置静默
-            return [background]
+            return [wake_id]
         return []
 
     # ---------- 唤醒（v5.1：交给 WakeChannel，全插件唯一非官方路径被隔离）----------
-    async def _woke_for_care(self, target: dict, background: str,
-                            with_topic: bool = True) -> tuple[bool, str]:
+    async def _woke_for_care(self, target: dict, wake_facts: str,
+                            with_topic: bool = True, *, channel: str = "care",
+                            plan_id: int = 0, wake_source: str = "") -> tuple[bool, str]:
         """唤醒 bot 本人开口（v5 终极方案，v5.1 起实现隔离在 core/wake.py）。
 
         把带真实会话的 CronMessageEvent（is_wake=True）推入事件总线，
@@ -309,4 +329,12 @@ class Executor:
         session_str = self._target_session(target)
         if not session_str:
             return False, ""
-        return await self.wake_channel.wake(session_str, background, with_topic=with_topic)
+        return await self.wake_channel.wake(
+            session_str,
+            wake_facts,
+            with_topic=with_topic,
+            target_id=target.get("id", 0),
+            channel=channel,
+            plan_id=plan_id,
+            wake_source=wake_source or channel,
+        )

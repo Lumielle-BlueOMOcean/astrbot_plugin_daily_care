@@ -13,13 +13,14 @@ DecisionEngine 输入：
 
 决策输出（结构化 JSON）：
 - decision: act（现在开口）/ plan（规划未来关怀）/ silent（不开口）
-- background: 客观事实背景（act/plan 时必填，绝不含话术）
+- focus_event_ids: 当前关怀对象 active event 的 ID 列表
 - plan_date: 未来关怀日期 YYYY-MM-DD（plan 时必填）
 - trigger_window: morning/noon/evening/night（plan 时必填，执行层窗口内随机时刻触发）
-- reason: 简短理由
+- category: weather/state/proactive
+- reason: 简短理由（仅内部日志）
 
 核心原则：
-1. 决策 LLM 只决定"要不要 + 背景 + 时间"，绝不生成话术——话永远由 bot 本人开口时说。
+1. 决策 LLM 只决定"要不要 + 事件 + 时间"，绝不生成背景事实或话术——事实由 Python 从数据库事件构造，话永远由 bot 本人开口时说。
 2. 触发时间是"随机区间"而非固定时间点，模拟"想起来就关心"的人类节奏。
 3. 防重复靠"让决策 LLM 看到最近说过什么"，而非硬规则去重。
 """
@@ -132,8 +133,62 @@ def random_ts_in_window(plan_date: str, window: str, now_ts: int = 0) -> int:
     return _r.randint(lo, hi)
 
 
+def _parse_focus_event_ids(value) -> Optional[list[int]]:
+    """严格解析决策模型选择的事件 ID；``None`` 表示字段非法。"""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        return None
+    result = []
+    seen = set()
+    for item in value:
+        if isinstance(item, bool):
+            return None
+        if isinstance(item, int):
+            event_id = item
+        elif isinstance(item, str) and item.strip().isdigit():
+            event_id = int(item.strip())
+        else:
+            return None
+        if event_id <= 0 or event_id in seen:
+            return None
+        seen.add(event_id)
+        result.append(event_id)
+    return result
+
+
+def _event_wake_fact(event: dict) -> str:
+    """从数据库事件提取事实，不接受模型另写的替代文本。"""
+    summary = str(event.get("summary") or "").strip()
+    detail = str(event.get("detail") or "").strip()
+    if summary and detail and detail != summary:
+        return f"{summary}\n{detail}"
+    return summary or detail
+
+
+def _select_wake_events(events: list[dict], focus_event_ids: list[int]):
+    """校验事件选择并按数据库顺序返回事实事件。"""
+    if not focus_event_ids:
+        return []
+    by_id = {int(event.get("id")): event for event in events if event.get("id") is not None}
+    if any(event_id not in by_id for event_id in focus_event_ids):
+        return None
+    selected = [by_id[event_id] for event_id in focus_event_ids]
+    if any(not _event_wake_fact(event) for event in selected):
+        return None
+    return selected
+
+
+def _build_wake_facts(events: list[dict], focus_event_ids: list[int]) -> str:
+    """以当前 active event 为唯一事实来源，稳定生成 wake facts。"""
+    selected = _select_wake_events(events, focus_event_ids)
+    if selected is None:
+        return ""
+    return "\n".join(_event_wake_fact(event) for event in selected)
+
+
 class DecisionEngine:
-    """关怀决策引擎：LLM 决定是否开口 / 何时开口 / 以什么背景开口。"""
+    """关怀决策引擎：LLM 决定是否开口 / 何时开口 / 选择哪些真实事件。"""
 
     def __init__(self, db: CareDatabase, config: dict, llm_func):
         self.db = db
@@ -171,7 +226,7 @@ class DecisionEngine:
             # v1.01：事件带上 cause 标识（如 weather/daily-note），供决策层识别常态天气提示
             tag = e["source"] + (f"/{e['cause']}" if e.get("cause") else "")
             ev_lines.append(
-                f"- [{tag}] {created}：{e['summary']}"
+                f"- 事件#{e['id']} [{tag}] {created}：{e['summary']}"
                 + (f"（{e['detail']}）" if e.get("detail") and e["source"] == "state" else "")
             )
         # 常态天气提示倾向时段（1.0.0：多选+自定义，解析为列表）
@@ -207,9 +262,9 @@ class DecisionEngine:
     def _build_prompt(self, ctx: dict) -> tuple[str, str]:
         system = (
             "你是关怀决策引擎。基于感知到的信息，决定此刻是否值得主动关怀用户，以及关怀的时间安排。\n"
-            "你只负责决策和提供客观事实背景，绝对不要生成关怀话术、完整句子或建议文案。\n\n"
+            "你只负责决策和选择真实事件，绝对不要生成关怀话术、事实背景、完整句子或建议文案。\n\n"
             "只输出一个 JSON 对象（不要 markdown 代码块，不要额外解释）：\n"
-            '{"decision":"act|plan|silent", "background":"一句话客观事实", '
+            '{"decision":"act|plan|silent", "focus_event_ids":[事件ID], '
             '"plan_date":"YYYY-MM-DD（仅plan时需要）", "trigger_window":"morning|noon|evening|night（仅plan时需要）", '
             '"category":"weather|state|proactive（可选，本次开口的归属类别）", "reason":"简短理由"}\n\n'
             "决策规则：\n"
@@ -218,7 +273,7 @@ class DecisionEngine:
             "2. plan：当前不适合立刻开口，但值得在【未来】某时段关怀——例如发现用户生病，"
             "可以规划明天或后天早上的问候；天气预警在明天，可以规划明天对应时段的提醒。\n"
             "3. silent：没有值得关怀的理由，或今日关怀已接近上限，或距离上次开口太近（避免打扰）。\n"
-            "4. background 必须是客观事实（如'你所在的城市明天傍晚有暴雨'），不要出现'记得''小心''带上'等词。\n"
+            "4. focus_event_ids 只能填写上方『感知到的事件』中属于当前关怀对象的事件编号；不要自行填写事件内容。\n"
             "5. 参考『最近提醒过』的内容：如果同类提醒刚说过且情况没有新变化，倾向 silent；"
             "如果情况有实质进展（雨真的下起来了、用户说更难受了），可以换个角度再开口——唠叨是人类关怀的一部分。\n"
             "6. 今日关怀次数若已达到上限，除非有极端情况，否则 silent。\n"
@@ -230,13 +285,14 @@ class DecisionEngine:
             "（如暴雨/雷电/台风/用户明显不适），否则必须输出 silent，绝不在聊天中插入主动关怀。"
             "『最近双方交流』含 bot 自己的正常回复，只要对话在流动就视为活跃期。\n"
             "8. 若『对话已静默』信息存在且静默时间较长（≥120分钟）、今日开口不多，"
-            "可以考虑 act——这是主动开启话题的自然契机，background 写客观事实如"
-            "'我们有一阵子没说话了'；但若静默时间过短（<60分钟）不要 act，避免打扰。\n"
+            "可以考虑 act——这是主动开启话题的自然契机；此时 focus_event_ids 可为空，category 输出 proactive；"
+            "但若静默时间过短（<60分钟）不要 act，避免打扰。\n"
             "9. 若事件中有『常态天气提示』（cause 含 daily-note）：这是每天固定的天气问候，"
             "属于低优先级日常关怀——若『当前在倾向时段内』为真（见用户输入）且并非"
-            "勿扰时段、今日开口不多，倾向 act，background 直接用该事件的天气事实；"
+            "勿扰时段、今日开口不多，倾向 act，focus_event_ids 选择该事件；"
             "若刚提醒过同类内容（见『最近提醒过』）则 silent，避免重复。\n"
-            "10. category 字段（仅 act 时需要）：若 background 引用的是天气事实（如天气预警、显著变化、常态天气问候），输出 weather；若引用用户状态（不适/情绪/作息等），输出 state；若因静默冷场主动开启话题，输出 proactive。这用于消息分轨计数，请如实归类。\n"
+            "10. category 字段（仅 act 时需要）：所选事件来自天气则输出 weather，来自用户状态则输出 state；"
+            "无事件的冷场主动输出 proactive。这用于消息分轨计数，请如实归类。\n"
         )
         if ctx.get("guarantee"):
             system += (
@@ -249,8 +305,7 @@ class DecisionEngine:
                 "- 仅当处于勿扰时段或当前确实极不适合打扰时，才允许输出 plan，"
                 "且 plan_date 必须是【今天】，trigger_window 必须是今天尚未结束的窗口，"
                 "绝对禁止把开口推到明天或更远。\n"
-                "- background 必须给出一个真实、自然的开口理由（天气变化、"
-                "用户近况、或单纯的'我们有一阵子没说话了'）。\n"
+                "- 不要编写任何 background 或用户话术；若无事件，focus_event_ids 保持为空并输出 category=proactive。\n"
             )
         user_lines = [
             f"关怀对象：{ctx['target_name']}",
@@ -302,38 +357,79 @@ class DecisionEngine:
         decision = str(data.get("decision", "silent")).strip().lower()
         if decision not in ("act", "plan", "silent"):
             decision = "silent"
-        bg = str(data.get("background", "")).strip()
         reason = str(data.get("reason", "")).strip()
         plan_date = str(data.get("plan_date", "")).strip()
         window = str(data.get("trigger_window", "")).strip()
         if window not in WINDOWS:
             window = ""
-        # v1.00：category 分轨（weather/state/proactive），供消息计数隔离；缺省按 state 处理
+
+        # ``background`` is deliberately ignored.  The decision model may
+        # describe its internal state there (or attempt prompt injection),
+        # but only the selected active database events can become wake facts.
+        events = self.db.get_active_events(target["id"])
+        raw_focus_ids = data.get("focus_event_ids")
+        focus_event_ids = _parse_focus_event_ids(raw_focus_ids)
+        selection_invalid = focus_event_ids is None
+        if selection_invalid:
+            focus_event_ids = []
+        selected_events = None if selection_invalid else _select_wake_events(events, focus_event_ids)
+        if selected_events is None:
+            selection_invalid = True
+            selected_events = []
+
         category = str(data.get("category", "")).strip().lower()
         if category not in ("weather", "state", "proactive"):
-            category = "state"
+            category = ""
+        if selected_events:
+            sources = {str(event.get("source") or "").strip().lower() for event in selected_events}
+            selected_category = "weather" if sources == {"weather"} else "state" if sources == {"state"} else ""
+            if not selected_category or (category and category != selected_category):
+                selection_invalid = True
+            else:
+                category = selected_category
+        elif source == "proactive" and not focus_event_ids and category in ("", "proactive"):
+            category = "proactive"
+        elif decision in ("act", "plan"):
+            selection_invalid = True
+
+        wake_facts = "" if selection_invalid else _build_wake_facts(events, focus_event_ids)
+        # Non-proactive actions without a valid event are fail-closed.  The
+        # proactive path intentionally supports an empty facts list because
+        # the real Main Agent already has the conversation and memories.
+        if selection_invalid and decision in ("act", "plan"):
+            decision = "silent"
+            focus_event_ids = []
+            wake_facts = ""
+            if not category:
+                category = "state"
         result = {
             "decision": decision,
-            "background": bg,
+            # Keep this legacy DB field for schema compatibility, but its
+            # value is now deterministic wake facts, never model prose.
+            "background": wake_facts,
+            "wake_facts": wake_facts,
+            "focus_event_ids": focus_event_ids,
             "plan_date": plan_date,
             "trigger_window": window,
-            "category": category,
+            "category": category or "state",
             "reason": reason,
         }
         # ---- 保底硬约束：静默保底命中时，决不允许 silent 或把开口推到明天 ----
         if self._guarantee:
             if decision == "silent":
                 decision = "act"
-                if not bg:
-                    bg = "我们有一阵子没说话了，有点惦记你"
+                if source == "proactive" and not focus_event_ids:
+                    category = "proactive"
+                    wake_facts = ""
                 logger.info("[DailyCare] 保底触发：silent 被强制转为 act")
             elif decision == "plan":
                 in_dnd = self._in_dnd()
                 if not in_dnd:
                     # 非勿扰时段：plan 直接转 act，静默区间内必须立刻开口
                     decision = "act"
-                    if not bg:
-                        bg = "我们有一阵子没说话了，有点惦记你"
+                    if source == "proactive" and not focus_event_ids:
+                        category = "proactive"
+                        wake_facts = ""
                     logger.info("[DailyCare] 保底触发：非勿扰时段，plan 强制转为 act")
                 else:
                     # 勿扰时段：允许 plan 到今天最近窗口，绝不推到明天
@@ -357,14 +453,18 @@ class DecisionEngine:
             result["decision"] = decision
             result["plan_date"] = plan_date
             result["trigger_window"] = window
+            result["category"] = category or "state"
+            result["background"] = wake_facts
+            result["wake_facts"] = wake_facts
+            result["focus_event_ids"] = focus_event_ids
         # 记录决策日志
         self.db.add_decision_log(
-            source=source, decision=decision, background=bg,
+            source=source, decision=decision, background=wake_facts,
             plan_date=plan_date, trigger_window=window, reason=reason,
         )
         logger.info(
             f"[DailyCare] 决策结果: {decision}"
-            + (f" 背景={bg[:40]}..." if bg else "")
+            + (f" 事实={wake_facts[:40]}..." if wake_facts else "")
             + (f" 计划={plan_date}@{window}" if decision == "plan" else "")
         )
         return result
@@ -374,10 +474,12 @@ class DecisionEngine:
         """把 plan 决策落地为关怀计划（care_plans），随机触发时刻在窗口内。"""
         if decision.get("decision") != "plan":
             return None
-        bg = decision.get("background", "")
+        bg = decision.get("wake_facts") or ""
         plan_date = decision.get("plan_date", "")
         window = decision.get("trigger_window", "")
-        if not bg or not plan_date or not window:
+        category = str(decision.get("category", "") or "").strip().lower()
+        is_proactive = category == "proactive" and not decision.get("focus_event_ids")
+        if (not bg and not is_proactive) or not plan_date or not window:
             return None
         # 校验日期格式，确保是未来日期（至少今天）
         try:
@@ -388,12 +490,10 @@ class DecisionEngine:
         if d.date() < date.today():
             d = datetime.now() + timedelta(days=1)
             plan_date = d.strftime("%Y-%m-%d")
-        # 关联事件：找背景最匹配的活跃事件（无则 0）
-        event_id = 0
-        for ev in self.db.get_active_events(target["id"]):
-            if ev["summary"] and bg and (ev["summary"][:12] in bg or bg[:12] in ev["summary"]):
-                event_id = ev["id"]
-                break
+        # 关联事件只能使用模型明确选择、且已被上面的决策校验过的 ID。
+        active_ids = {event["id"] for event in self.db.get_active_events(target["id"])}
+        focus_ids = decision.get("focus_event_ids") or []
+        event_id = next((event_id for event_id in focus_ids if event_id in active_ids), 0)
         # 生成窗口内随机触发时刻
         trigger_ts = random_ts_in_window(plan_date, window)
         pid = self.db.add_plan(
@@ -401,7 +501,7 @@ class DecisionEngine:
             target_id=target["id"],
             plan_date=plan_date,
             trigger_window=window,
-            task_type="care",
+            task_type="proactive" if is_proactive else "care",
             content_summary=bg,
         )
         # 补写随机触发时刻

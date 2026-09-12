@@ -58,6 +58,31 @@ def make_db():
     return db
 
 
+def test_wake_protocol():
+    """主动唤醒输出协议必须严格解析，任何旁白都 fail closed。"""
+    from core.wake_protocol import WakeOutput, parse_wake_output
+
+    assert parse_wake_output('{"action":"send","message":"午饭吃了吗？"}') == WakeOutput(
+        action="send", message="午饭吃了吗？"
+    )
+    assert parse_wake_output('{"action":"silent","message":""}') == WakeOutput(
+        action="silent", message=""
+    )
+    invalid = [
+        "所以这条按住不发。",
+        '说明：{"action":"send","message":"你好"}',
+        '{"action":"send","message":"你好"}说明',
+        '```json\n{"action":"send","message":"你好"}\n```',
+        '{"action":"ignore","message":"你好"}',
+        '{"action":"send","message":""}',
+        '{"action":"send","message":"你好","reason":"内部说明"}',
+        '14:27。今天已经六条了，一条没回，所以这条按住不发。',
+    ]
+    for raw in invalid:
+        assert parse_wake_output(raw) is None, raw
+    print("✓ 主动唤醒严格输出协议测试通过")
+
+
 def test_database():
     db = make_db()
     t_id = db.get_default_target()["id"]
@@ -74,6 +99,286 @@ def test_database():
     db.add_send_log(t_id, 0, "hi", "test")
     assert db.count_send_today(t_id, datetime.now().strftime("%Y-%m-%d")) == 1
     print("✓ 数据库测试通过")
+
+
+def test_plan_and_send_lifecycle():
+    """入队、实际发送、沉默与重启恢复必须是不同状态。"""
+    from core.executor import Executor
+
+    db = make_db()
+    target = db.get_default_target()
+    today = datetime.now().strftime("%Y-%m-%d")
+    event_id = db.add_event(target["id"], "state", "需要休息", "用户说累", ttl_hours=72)
+    plan_id = db.add_plan(event_id, target["id"], today, "evening", "care", "需要休息")
+    assert db.mark_plan(plan_id, "processing") is True
+    assert db.get_pending_plans(today) == []
+    assert db.mark_plan(plan_id, "processing") is False
+    assert db.mark_plan(plan_id, "sent") is True
+    assert db.mark_plan(plan_id, "sent") is False
+    with db._connect() as conn:
+        assert conn.execute("SELECT status FROM care_plans WHERE id=?", (plan_id,)).fetchone()[0] == "sent"
+
+    # 一个成功入队但尚未有平台发送确认的立即唤醒，不得改变发送统计。
+    db2 = make_db()
+    target2 = db2.get_default_target()
+    ex = Executor(db2, {"silence_exclude_window_min": 0}, FakeContext(), None)
+    ex.in_dnd = lambda: False
+
+    async def fake_enqueue(target, wake_facts, with_topic=True, **kwargs):
+        return True, "wake-enqueue-1"
+
+    ex._woke_for_care = fake_enqueue
+    assert asyncio.run(ex.execute_immediate("客观事实", channel="care", target=target2)) is True
+    assert db2.count_send_today(target2["id"], today, "care") == 0
+    assert db2.kv_get(f"last_care_send_{target2['id']}", 0) == 0
+    assert db2.kv_get("last_activity_ts", 0) == 0
+
+    # 模拟 after_message_sent 的实际提交，以及 silent/invalid 的跳过。
+    db2.add_send_log(target2["id"], 0, "用户真正看到的正文", "care")
+    db2.kv_set(f"last_care_send_{target2['id']}", int(time.time()))
+    db2.kv_set("last_activity_ts", int(time.time()))
+    assert db2.count_send_today(target2["id"], today, "care") == 1
+
+    event2 = db2.add_event(target2["id"], "state", "计划事实", "详情", ttl_hours=72)
+    plan2 = db2.add_plan(event2, target2["id"], today, "morning", "care", "计划事实")
+    assert db2.mark_plan(plan2, "processing") is True
+    assert db2.mark_plan(plan2, "skipped") is True
+
+    event3 = db2.add_event(target2["id"], "state", "遗留事实", "详情", ttl_hours=72)
+    plan3 = db2.add_plan(event3, target2["id"], today, "noon", "care", "遗留事实")
+    assert db2.mark_plan(plan3, "processing") is True
+    assert db2.recover_processing_plans() == 1
+    assert db2.get_pending_plans(today)[0]["id"] == plan3
+    print("✓ 入队/实际发送/计划状态生命周期测试通过")
+
+
+def test_wake_event_contract():
+    """WakeChannel 只注入临时事实，并携带禁流式与 wake identity。"""
+    import types as _types
+    from core.wake import WakeChannel
+
+    class TempTextPart:
+        def __init__(self, text):
+            self.text = text
+            self._no_save = False
+
+        def mark_as_temp(self):
+            self._no_save = True
+            return self
+
+    class ProviderRequest:
+        def __init__(self):
+            self.extra_user_content_parts = []
+            self.prompt = ""
+
+    class Session:
+        platform_id = "TestPlatform"
+        message_type = "FriendMessage"
+
+        @classmethod
+        def from_str(cls, value):
+            return cls()
+
+    class Event:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    fake_modules = {
+        "astrbot.core": _types.ModuleType("astrbot.core"),
+        "astrbot.core.agent": _types.ModuleType("astrbot.core.agent"),
+        "astrbot.core.agent.message": _types.ModuleType("astrbot.core.agent.message"),
+        "astrbot.core.cron": _types.ModuleType("astrbot.core.cron"),
+        "astrbot.core.cron.events": _types.ModuleType("astrbot.core.cron.events"),
+        "astrbot.core.platform": _types.ModuleType("astrbot.core.platform"),
+        "astrbot.core.platform.message_session": _types.ModuleType("astrbot.core.platform.message_session"),
+        "astrbot.core.provider": _types.ModuleType("astrbot.core.provider"),
+        "astrbot.core.provider.entities": _types.ModuleType("astrbot.core.provider.entities"),
+    }
+    fake_modules["astrbot.core.agent.message"].TextPart = TempTextPart
+    fake_modules["astrbot.core.cron.events"].CronMessageEvent = Event
+    fake_modules["astrbot.core.platform.message_session"].MessageSession = Session
+    fake_modules["astrbot.core.provider.entities"].ProviderRequest = ProviderRequest
+    old = {name: sys.modules.get(name) for name in fake_modules}
+    sys.modules.update(fake_modules)
+
+    class Queue:
+        def __init__(self): self.items = []
+        async def put(self, event): self.items.append(event)
+
+    class Ctx:
+        def __init__(self): self.queue = Queue(); self.conversation_manager = None
+        def get_event_queue(self): return self.queue
+
+    try:
+        ctx = Ctx()
+        ok, wake_id = asyncio.run(WakeChannel(ctx, {}).wake(
+            "TestPlatform:FriendMessage:42", "天气事实", target_id=7,
+            channel="weather", wake_source="weather",
+        ))
+        assert ok and wake_id
+        event = ctx.queue.items[0]
+        assert event.extras["enable_streaming"] is False
+        assert set(event.extras["daily_care"]) >= {
+            "kind", "wake_id", "target_id", "channel", "plan_id", "wake_source"
+        }
+        assert "background" not in event.extras["daily_care"]
+        assert event.extras["provider_request"].extra_user_content_parts[0]._no_save is True
+        assert asyncio.run(WakeChannel(ctx, {}).wake(
+            "TestPlatform:FriendMessage:42", "", channel="care"
+        )) == (False, "")
+    finally:
+        for name, previous in old.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+    print("✓ Wake event contract 测试通过")
+
+
+def test_main_wake_hooks_and_scope():
+    """验证 Main Agent 输出边界、历史清理、实际发送幂等与普通聊天隔离。"""
+    import importlib
+    import types as _types
+
+    class Filter:
+        class EventMessageType:
+            PRIVATE_MESSAGE = 1
+            GROUP_MESSAGE = 2
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: (lambda func: func)
+
+    _api.AstrBotConfig = dict
+    event_mod = _types.ModuleType("astrbot.api.event")
+    event_mod.AstrMessageEvent = object
+    event_mod.filter = Filter()
+    star_mod = _types.ModuleType("astrbot.api.star")
+    star_mod.Context = object
+    star_mod.Star = type("Star", (), {"__init__": lambda self, context: setattr(self, "context", context)})
+    star_mod.register = lambda *args, **kwargs: (lambda cls: cls)
+    weather_mod = _types.ModuleType("astrbot_plugin_daily_care.core.weather_tool")
+    weather_mod.WeatherTool = type("WeatherTool", (), {})
+    webapi_mod = _types.ModuleType("astrbot_plugin_daily_care.core.webapi")
+    webapi_mod.CareWebAPI = type("CareWebAPI", (), {})
+    core_mod = _types.ModuleType("astrbot.core")
+    agent_mod = _types.ModuleType("astrbot.core.agent")
+    message_mod = _types.ModuleType("astrbot.core.agent.message")
+
+    class RuntimeTextPart:
+        def __init__(self, text):
+            self.text = text
+            self._no_save = False
+
+    message_mod.TextPart = RuntimeTextPart
+    names = {
+        "astrbot.api.event": event_mod,
+        "astrbot.api.star": star_mod,
+        "astrbot_plugin_daily_care.core.weather_tool": weather_mod,
+        "astrbot_plugin_daily_care.core.webapi": webapi_mod,
+        "astrbot.core": core_mod,
+        "astrbot.core.agent": agent_mod,
+        "astrbot.core.agent.message": message_mod,
+    }
+    old = {name: sys.modules.get(name) for name in names}
+    sys.modules.update(names)
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+    class RuntimeMessage:
+        def __init__(self, role, content):
+            self.role = role
+            self.content = content
+            self._no_save = False
+
+    class Response:
+        def __init__(self, text):
+            self.completion_text = text
+            self.result_chain = ["raw-envelope"]
+
+    class Result:
+        def __init__(self): self.chain = ["raw"]
+
+    class Event:
+        def __init__(self, care):
+            self.extra = {"daily_care": care}
+            self.result = Result()
+            self._has_send_oper = True
+
+        def get_extra(self, key, default=None): return self.extra.get(key, default)
+        def set_extra(self, key, value): self.extra[key] = value
+        def get_result(self): return self.result
+
+    try:
+        plugin_mod = importlib.import_module("astrbot_plugin_daily_care.main")
+        db = make_db()
+        target_id = db.get_default_target()["id"]
+        plugin = plugin_mod.DailyCarePlugin.__new__(plugin_mod.DailyCarePlugin)
+        plugin.db = db
+
+        class FakeExecutor:
+            @staticmethod
+            def _last_send_key(target_id, channel):
+                return f"last_{channel}_{target_id}"
+
+        plugin._executor = FakeExecutor()
+        care = {
+            "kind": "wake", "wake_id": "hook-1", "target_id": target_id,
+            "channel": "care", "plan_id": 0, "wake_source": "care",
+        }
+        run_context = _types.SimpleNamespace(messages=[
+            RuntimeMessage("user", [RuntimeTextPart("temporary")]),
+            RuntimeMessage("assistant", [RuntimeTextPart("envelope")]),
+        ])
+        response = Response('{"action":"send","message":"午饭吃了吗？"}')
+        event = Event(care)
+        asyncio.run(plugin._on_agent_done_care_wake(event, run_context, response))
+        assert response.completion_text == "午饭吃了吗？"
+        assert response.result_chain is None
+        assert run_context.messages[0]._no_save is True
+        assert run_context.messages[1].content[0].text == "午饭吃了吗？"
+        assert event.get_extra("daily_care_outcome") == "send"
+        asyncio.run(plugin._on_decorating_result_care_wake(event))
+        assert len(event.get_result().chain) == 1
+        assert event.get_result().chain[0].text == "午饭吃了吗？"
+        asyncio.run(plugin._after_message_sent_care_wake(event))
+        asyncio.run(plugin._after_message_sent_care_wake(event))
+        assert db.count_send_today(target_id, datetime.now().strftime("%Y-%m-%d"), "care") == 1
+        assert db.get_recent_reminders(target_id)[0] == "午饭吃了吗？"
+
+        bad_context = _types.SimpleNamespace(messages=[
+            RuntimeMessage("user", [RuntimeTextPart("temporary")]),
+            RuntimeMessage("assistant", [RuntimeTextPart("raw")]),
+        ])
+        bad_event = Event(care)
+        bad_response = Response("14:27。今天已经六条了，一条没回，所以这条按住不发。")
+        asyncio.run(plugin._on_agent_done_care_wake(bad_event, bad_context, bad_response))
+        assert bad_response.completion_text == ""
+        assert bad_context.messages[0]._no_save is True
+        assert bad_context.messages[1]._no_save is True
+        assert bad_event.get_extra("daily_care_outcome") == "invalid"
+        asyncio.run(plugin._on_decorating_result_care_wake(bad_event))
+        assert bad_event.get_result().chain == []
+
+        class Request:
+            def __init__(self): self.func_tool = "ordinary-tools"
+
+        class RequestEvent:
+            def __init__(self, extras): self.extras = extras
+            def get_extra(self, key, default=None): return self.extras.get(key, default)
+            def set_extra(self, key, value): self.extras[key] = value
+
+        ordinary_request = Request()
+        asyncio.run(plugin._on_llm_request_care_wake(RequestEvent({}), ordinary_request))
+        assert ordinary_request.func_tool == "ordinary-tools"
+        wake_request = Request()
+        asyncio.run(plugin._on_llm_request_care_wake(RequestEvent({"daily_care": care}), wake_request))
+        assert wake_request.func_tool is None
+    finally:
+        for name, previous in old.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+    print("✓ Main Agent 输出/历史/实际发送/普通事件隔离测试通过")
 
 
 def test_weather_analyze():
@@ -766,6 +1071,75 @@ def test_decision_category_track():
     print("✓ 决策 category 分轨（weather/state/缺省）测试通过")
 
 
+def test_decision_isolation_and_focus_events():
+    """决策模型只能选择真实事件，不能编写会穿透到 wake 的事实。"""
+    from core.decision import DecisionEngine
+
+    db = make_db()
+    target = db.get_default_target()
+    event_id = db.add_event(
+        target["id"], "state", "身体不适：感冒", "用户说感冒", intensity=3, priority=3, ttl_hours=72
+    )
+    prompts = []
+
+    async def fake_llm(system, user):
+        prompts.append(user)
+        return json.dumps({
+            "decision": "act",
+            "background": "今天已经发了6条，一条没回，所以这条按住不发。",
+            "focus_event_ids": [event_id],
+            "category": "state",
+            "reason": "需要关注",
+        }, ensure_ascii=False)
+
+    result = asyncio.run(DecisionEngine(db, {}, fake_llm).decide(target))
+    assert result["decision"] == "act"
+    assert result["focus_event_ids"] == [event_id]
+    assert result["background"] == "身体不适：感冒\n用户说感冒"
+    assert result["wake_facts"] == result["background"]
+    assert "今天已经发了6条" not in result["background"]
+    assert f"事件#{event_id}" in prompts[0]
+
+    async def invalid_event_llm(system, user):
+        return json.dumps({
+            "decision": "act",
+            "background": "模型自写的替代事实",
+            "focus_event_ids": [999999],
+            "category": "state",
+        }, ensure_ascii=False)
+
+    invalid = asyncio.run(DecisionEngine(db, {}, invalid_event_llm).decide(target))
+    assert invalid["decision"] == "silent"
+    assert invalid["background"] == ""
+    assert invalid["wake_facts"] == ""
+
+    async def proactive_llm(system, user):
+        return json.dumps({
+            "decision": "act",
+            "background": "我们有一阵子没说话了，有点惦记你",
+            "category": "proactive",
+        }, ensure_ascii=False)
+
+    proactive = asyncio.run(DecisionEngine(db, {}, proactive_llm).decide(target, source="proactive"))
+    assert proactive["decision"] == "act"
+    assert proactive["category"] == "proactive"
+    assert proactive["background"] == ""
+    assert proactive["wake_facts"] == ""
+
+    async def guarantee_silent_llm(system, user):
+        return '{"decision":"silent","background":"","category":"proactive"}'
+
+    guaranteed = asyncio.run(
+        DecisionEngine(db, {}, guarantee_silent_llm).decide(
+            target, source="proactive", guarantee=True
+        )
+    )
+    assert guaranteed["decision"] == "act"
+    assert guaranteed["background"] == ""
+    assert "惦记你" not in guaranteed["background"]
+    print("✓ 决策控制上下文与 wake facts 隔离测试通过")
+
+
 
 def test_daily_note_text():
     """v1.01：常态天气提示文本——温度体感区间映射 + 客观事实"""
@@ -1238,7 +1612,11 @@ def test_mutex_between_proactive_and_care():
 
 
 if __name__ == "__main__":
+    test_wake_protocol()
     test_database()
+    test_plan_and_send_lifecycle()
+    test_wake_event_contract()
+    test_main_wake_hooks_and_scope()
     test_weather_analyze()
     test_chat_reflector()
     test_weather_judge()
@@ -1259,6 +1637,7 @@ if __name__ == "__main__":
     test_seen_unseen_full_scan()
     test_seen_mark_after_main_analysis()
     test_decision_category_track()
+    test_decision_isolation_and_focus_events()
     test_daily_note_text()
     test_note_windows_multi()
     test_daily_note_gap()

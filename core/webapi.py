@@ -509,9 +509,9 @@ class CareWebAPI:
             events = self.plugin.db.get_active_events(target["id"])
             bg = self.plugin._executor._compose_background(target, events) if events else ""
             if not bg:
-                return self._ok({"events": evs, "sent": [], "message": "天气检查完成，当前无值得开口的事件"})
-            sent = await self.plugin._executor.test_send(bg)
-            return self._ok({"events": evs, "sent": sent, "message": f"天气检查 {len(evs)} 条，已唤醒开口 {len(sent)} 条"})
+                return self._ok({"events": evs, "queued": [], "message": "天气检查完成，当前无值得唤醒的事件"})
+            queued = await self.plugin._executor.test_send(bg)
+            return self._ok({"events": evs, "queued": queued, "message": f"天气检查 {len(evs)} 条，主动唤醒已入队 {len(queued)} 条，等待 Main Agent 决定是否开口"})
         except Exception as e:
             return self._err(f"测试关怀失败: {e}")
 
