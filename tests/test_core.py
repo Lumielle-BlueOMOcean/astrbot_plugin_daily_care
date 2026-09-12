@@ -174,14 +174,151 @@ def test_wake_event_contract():
     class Session:
         platform_id = "TestPlatform"
         message_type = "FriendMessage"
+        session_id = "42"
 
         @classmethod
         def from_str(cls, value):
             return cls()
 
-    class Event:
+    class AstrMessageEvent:
+        async def send(self, message):
+            self._has_send_oper = True
+
+    class Event(AstrMessageEvent):
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
+            self._extras = kwargs.get("extras", {}).copy()
+            self._has_send_oper = False
+
+        def get_extra(self, key, default=None):
+            return self._extras.get(key, default)
+
+        def set_extra(self, key, value):
+            self._extras[key] = value
+
+    fake_modules = {
+        "astrbot.core": _types.ModuleType("astrbot.core"),
+        "astrbot.core.agent": _types.ModuleType("astrbot.core.agent"),
+        "astrbot.core.agent.message": _types.ModuleType("astrbot.core.agent.message"),
+        "astrbot.core.cron": _types.ModuleType("astrbot.core.cron"),
+        "astrbot.core.cron.events": _types.ModuleType("astrbot.core.cron.events"),
+        "astrbot.core.platform": _types.ModuleType("astrbot.core.platform"),
+        "astrbot.core.platform.astr_message_event": _types.ModuleType("astrbot.core.platform.astr_message_event"),
+        "astrbot.core.platform.message_session": _types.ModuleType("astrbot.core.platform.message_session"),
+        "astrbot.core.provider": _types.ModuleType("astrbot.core.provider"),
+        "astrbot.core.provider.entities": _types.ModuleType("astrbot.core.provider.entities"),
+    }
+    fake_modules["astrbot.core.agent.message"].TextPart = TempTextPart
+    fake_modules["astrbot.core.cron.events"].CronMessageEvent = Event
+    fake_modules["astrbot.core.platform.astr_message_event"].AstrMessageEvent = AstrMessageEvent
+    fake_modules["astrbot.core.platform.message_session"].MessageSession = Session
+    fake_modules["astrbot.core.provider.entities"].ProviderRequest = ProviderRequest
+    old = {name: sys.modules.get(name) for name in fake_modules}
+    sys.modules.update(fake_modules)
+
+    class Queue:
+        def __init__(self): self.items = []
+        async def put(self, event): self.items.append(event)
+
+    class Conversation:
+        cid = "conversation-1"
+        history = "[]"
+
+    class ConversationManager:
+        async def get_curr_conversation_id(self, umo):
+            return "conversation-1"
+
+        async def new_conversation(self, umo, platform_id):
+            return "conversation-1"
+
+        async def get_conversation(self, umo, cid):
+            return Conversation()
+
+    class Ctx:
+        def __init__(self): self.queue = Queue(); self.conversation_manager = ConversationManager()
+        def get_event_queue(self): return self.queue
+
+    try:
+        ctx = Ctx()
+        ok, wake_id = asyncio.run(WakeChannel(ctx, {}).wake(
+            "TestPlatform:FriendMessage:42", "天气事实", target_id=7,
+            channel="weather", wake_source="weather",
+        ))
+        assert ok and wake_id
+        event = ctx.queue.items[0]
+        assert event.extras["enable_streaming"] is False
+        assert set(event.extras["daily_care"]) >= {
+            "kind", "wake_id", "target_id", "channel", "plan_id", "wake_source"
+        }
+        assert "background" not in event.extras["daily_care"]
+        assert event.extras["provider_request"].extra_user_content_parts[0]._no_save is True
+        event.context_obj = ctx
+        event.session = Session()
+        ctx.send_result = True
+        ctx.send_calls = 0
+        async def send_message(session, chain):
+            ctx.send_calls += 1
+            return ctx.send_result
+        ctx.send_message = send_message
+        asyncio.run(event.send("body"))
+        assert event.get_extra("daily_care_platform_sent") is True
+        assert event._has_send_oper is True
+        assert ctx.send_calls == 1
+        event_false = ctx.queue.items.pop()
+        event_false.context_obj = ctx
+        event_false.session = Session()
+        event_false._has_send_oper = True
+        ctx.send_result = False
+        asyncio.run(event_false.send("body"))
+        assert event_false.get_extra("daily_care_platform_sent") is False
+        assert event_false._has_send_oper is True
+        assert ctx.send_calls == 2
+        event_error = ctx.queue.items[0] if ctx.queue.items else event
+        event_error.context_obj = ctx
+        event_error.session = Session()
+        async def raise_send(session, chain):
+            ctx.send_calls += 1
+            raise RuntimeError("platform unavailable")
+        ctx.send_message = raise_send
+        try:
+            asyncio.run(event_error.send("body"))
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("platform exception must propagate")
+        assert event_error.get_extra("daily_care_platform_sent") is False
+        assert asyncio.run(WakeChannel(ctx, {}).wake(
+            "TestPlatform:FriendMessage:42", "", channel="care"
+        )) == (False, "")
+    finally:
+        for name, previous in old.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+    print("✓ Wake event contract 测试通过")
+
+
+def test_wake_requires_real_conversation():
+    """缺少真实 conversation 或历史损坏时，wake 必须 fail closed 且不入队。"""
+    import types as _types
+    from core.wake import WakeChannel
+
+    class TempTextPart:
+        def __init__(self, text): self.text = text; self._no_save = False
+        def mark_as_temp(self): self._no_save = True; return self
+
+    class ProviderRequest:
+        def __init__(self): self.extra_user_content_parts = []
+
+    class Session:
+        platform_id = "TestPlatform"
+        message_type = "FriendMessage"
+        @classmethod
+        def from_str(cls, value): return cls()
+
+    class Event:
+        def __init__(self, **kwargs): self.__dict__.update(kwargs)
 
     fake_modules = {
         "astrbot.core": _types.ModuleType("astrbot.core"),
@@ -205,34 +342,45 @@ def test_wake_event_contract():
         def __init__(self): self.items = []
         async def put(self, event): self.items.append(event)
 
+    class Conversation:
+        cid = "conversation-1"
+        history = "[]"
+
+    class Manager:
+        def __init__(self, mode): self.mode = mode
+        async def get_curr_conversation_id(self, umo):
+            if self.mode == "get_curr_error": raise RuntimeError("get current failed")
+            return "" if self.mode == "new_error" else "conversation-1"
+        async def new_conversation(self, umo, platform_id):
+            if self.mode == "new_error": raise RuntimeError("new failed")
+            return "conversation-1"
+        async def get_conversation(self, umo, cid):
+            if self.mode == "get_error": raise RuntimeError("get failed")
+            if self.mode == "missing": return None
+            conv = Conversation()
+            if self.mode == "bad_json": conv.history = "not-json"
+            if self.mode == "bad_shape": conv.history = json.dumps({"role": "user"})
+            return conv
+
     class Ctx:
-        def __init__(self): self.queue = Queue(); self.conversation_manager = None
+        def __init__(self, mode):
+            self.queue = Queue()
+            self.conversation_manager = None if mode is None else Manager(mode)
         def get_event_queue(self): return self.queue
 
     try:
-        ctx = Ctx()
-        ok, wake_id = asyncio.run(WakeChannel(ctx, {}).wake(
-            "TestPlatform:FriendMessage:42", "天气事实", target_id=7,
-            channel="weather", wake_source="weather",
-        ))
-        assert ok and wake_id
-        event = ctx.queue.items[0]
-        assert event.extras["enable_streaming"] is False
-        assert set(event.extras["daily_care"]) >= {
-            "kind", "wake_id", "target_id", "channel", "plan_id", "wake_source"
-        }
-        assert "background" not in event.extras["daily_care"]
-        assert event.extras["provider_request"].extra_user_content_parts[0]._no_save is True
-        assert asyncio.run(WakeChannel(ctx, {}).wake(
-            "TestPlatform:FriendMessage:42", "", channel="care"
-        )) == (False, "")
+        for mode in (None, "get_curr_error", "new_error", "get_error", "missing", "bad_json", "bad_shape"):
+            ctx = Ctx(mode)
+            ok, wake_id = asyncio.run(WakeChannel(ctx, {}).wake(
+                "TestPlatform:FriendMessage:42", "天气事实", channel="weather", wake_source="weather"
+            ))
+            assert (ok, wake_id) == (False, ""), mode
+            assert ctx.queue.items == [], mode
     finally:
         for name, previous in old.items():
-            if previous is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = previous
-    print("✓ Wake event contract 测试通过")
+            if previous is None: sys.modules.pop(name, None)
+            else: sys.modules[name] = previous
+    print("✓ 真实 conversation 缺失/损坏时 fail closed 测试通过")
 
 
 def test_main_wake_hooks_and_scope():
@@ -299,7 +447,7 @@ def test_main_wake_hooks_and_scope():
 
     class Event:
         def __init__(self, care):
-            self.extra = {"daily_care": care}
+            self.extra = {"daily_care": care, "daily_care_platform_sent": True}
             self.result = Result()
             self._has_send_oper = True
 
@@ -379,6 +527,238 @@ def test_main_wake_hooks_and_scope():
             else:
                 sys.modules[name] = previous
     print("✓ Main Agent 输出/历史/实际发送/普通事件隔离测试通过")
+
+
+def test_wake_history_commit_is_platform_confirmed_and_idempotent():
+    """SEND 只在平台确认后写入真实 conversation，且历史/发送状态各提交一次。"""
+    import contextlib
+    import importlib
+    import types as _types
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    _api.AstrBotConfig = dict
+    event_mod = _types.ModuleType("astrbot.api.event")
+    event_mod.AstrMessageEvent = object
+    event_mod.filter = _types.SimpleNamespace(
+        after_message_sent=lambda *a, **k: (lambda f: f),
+        on_agent_done=lambda *a, **k: (lambda f: f),
+        on_decorating_result=lambda *a, **k: (lambda f: f),
+        on_llm_request=lambda *a, **k: (lambda f: f),
+        event_message_type=lambda *a, **k: (lambda f: f),
+        EventMessageType=_types.SimpleNamespace(PRIVATE_MESSAGE=1, GROUP_MESSAGE=2),
+    )
+    star_mod = _types.ModuleType("astrbot.api.star")
+    star_mod.Context = object; star_mod.Star = type("Star", (), {"__init__": lambda self, context: setattr(self, "context", context)})
+    star_mod.register = lambda *args, **kwargs: (lambda cls: cls)
+    weather_mod = _types.ModuleType("astrbot_plugin_daily_care.core.weather_tool")
+    weather_mod.WeatherTool = type("WeatherTool", (), {})
+    webapi_mod = _types.ModuleType("astrbot_plugin_daily_care.core.webapi")
+    webapi_mod.CareWebAPI = type("CareWebAPI", (), {})
+    sys.modules.update({
+        "astrbot.api.event": event_mod,
+        "astrbot.api.star": star_mod,
+        "astrbot_plugin_daily_care.core.weather_tool": weather_mod,
+        "astrbot_plugin_daily_care.core.webapi": webapi_mod,
+    })
+    plugin_mod = importlib.import_module("astrbot_plugin_daily_care.main")
+    message_mod = _types.ModuleType("astrbot.core.agent.message")
+
+    class RuntimeTextPart:
+        def __init__(self, text): self.text = text; self._no_save = False
+        def model_dump(self): return {"type": "text", "text": self.text}
+
+    class AssistantMessageSegment:
+        def __init__(self, content): self.role = "assistant"; self.content = content
+        def model_dump(self):
+            return {"role": self.role, "content": [part.model_dump() for part in self.content]}
+
+    def dump_messages_with_checkpoints(messages):
+        return [message.model_dump() for message in messages]
+
+    message_mod.TextPart = RuntimeTextPart
+    message_mod.AssistantMessageSegment = AssistantMessageSegment
+    message_mod.dump_messages_with_checkpoints = dump_messages_with_checkpoints
+    session_lock_mod = _types.ModuleType("astrbot.core.utils.session_lock")
+
+    class LockManager:
+        @contextlib.asynccontextmanager
+        async def acquire_lock(self, session_id):
+            yield
+
+    session_lock_mod.session_lock_manager = LockManager()
+    names = {
+        "astrbot.core": _types.ModuleType("astrbot.core"),
+        "astrbot.core.agent": _types.ModuleType("astrbot.core.agent"),
+        "astrbot.core.agent.message": message_mod,
+        "astrbot.core.utils": _types.ModuleType("astrbot.core.utils"),
+        "astrbot.core.utils.session_lock": session_lock_mod,
+    }
+    old = {name: sys.modules.get(name) for name in names}
+    sys.modules.update(names)
+
+    class Conversation:
+        cid = "conversation-real"
+        history = json.dumps([{"role": "user", "content": "之前的真实对话"}])
+
+    class ConversationManager:
+        def __init__(self, fail=False): self.conversation = Conversation(); self.update_calls = 0; self.fail = fail
+        async def get_conversation(self, umo, cid):
+            assert cid == "conversation-real"
+            return self.conversation
+        async def update_conversation(self, umo, conversation_id, history=None, **kwargs):
+            self.update_calls += 1
+            if self.fail: raise RuntimeError("history write failed")
+            self.conversation.history = json.dumps(history, ensure_ascii=False)
+
+    class RuntimeMessage:
+        def __init__(self, role, content): self.role = role; self.content = content; self._no_save = False
+
+    class Response:
+        def __init__(self, text): self.completion_text = text; self.result_chain = ["raw-envelope"]
+
+    class Result:
+        def __init__(self): self.chain = ["raw"]
+
+    class Event:
+        def __init__(self, care, context):
+            self.extra = {"daily_care": care}
+            self.context_obj = context
+            self.unified_msg_origin = "TestPlatform:FriendMessage:42"
+            self.result = Result()
+            self._has_send_oper = True
+        def get_extra(self, key, default=None): return self.extra.get(key, default)
+        def set_extra(self, key, value): self.extra[key] = value
+        def get_result(self): return self.result
+
+    def make_plugin(db, context):
+        plugin = plugin_mod.DailyCarePlugin.__new__(plugin_mod.DailyCarePlugin)
+        plugin.db = db
+        plugin.context = context
+        class FakeExecutor:
+            @staticmethod
+            def _last_send_key(target_id, channel): return f"last_{channel}_send_{target_id}"
+        plugin._executor = FakeExecutor()
+        return plugin
+
+    try:
+        db = make_db()
+        target_id = db.get_default_target()["id"]
+        care = {
+            "kind": "wake", "wake_id": "history-1", "target_id": target_id,
+            "channel": "care", "plan_id": 0, "wake_source": "care",
+            "conversation_id": "conversation-real",
+        }
+        manager = ConversationManager()
+        context = _types.SimpleNamespace(conversation_manager=manager)
+        plugin = make_plugin(db, context)
+        run_context = _types.SimpleNamespace(messages=[
+            RuntimeMessage("user", [RuntimeTextPart("temporary wake note")]),
+            RuntimeMessage("assistant", [RuntimeTextPart("envelope")]),
+        ])
+        event = Event(care, context)
+        response = Response('{"action":"send","message":"午饭吃了吗？"}')
+        asyncio.run(plugin._on_agent_done_care_wake(event, run_context, response))
+        assert run_context.messages[0]._no_save is True
+        assert run_context.messages[1]._no_save is True
+        assert run_context.messages[1].content[0].text == "午饭吃了吗？"
+        event.set_extra("daily_care_platform_sent", True)
+        asyncio.run(plugin._after_message_sent_care_wake(event))
+        asyncio.run(plugin._after_message_sent_care_wake(event))
+        history = json.loads(manager.conversation.history)
+        assert history == [
+            {"role": "user", "content": "之前的真实对话"},
+            {"role": "assistant", "content": [{"type": "text", "text": "午饭吃了吗？"}]},
+        ]
+        assert manager.update_calls == 1
+        assert db.count_send_today(target_id, datetime.now().strftime("%Y-%m-%d"), "care") == 1
+
+        # 平台明确返回 False 时，即使旧式 _has_send_oper 为 True 也不能提交发送状态。
+        db_false = make_db()
+        false_target = db_false.get_default_target()["id"]
+        false_event = Event({**care, "target_id": false_target, "wake_id": "false-1"}, context)
+        false_event.set_extra("daily_care_platform_sent", False)
+        false_event.set_extra("daily_care_outcome", "send")
+        false_event.set_extra("daily_care_delivered_text", "不会发送")
+        asyncio.run(plugin_mod.DailyCarePlugin._after_message_sent_care_wake(plugin, false_event))
+        assert db_false.count_send_today(false_target, datetime.now().strftime("%Y-%m-%d"), "care") == 0
+        assert false_event.get_extra("daily_care_committed") is not True
+    finally:
+        for name, previous in old.items():
+            if previous is None: sys.modules.pop(name, None)
+            else: sys.modules[name] = previous
+    print("✓ 平台确认后历史提交与幂等测试通过")
+
+
+def test_wake_history_failure_does_not_resend_or_requeue():
+    """平台已成功但历史写回失败时，不重发、不回 pending，发送状态仍保持已完成。"""
+    import contextlib
+    import importlib
+    import types as _types
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    plugin_mod = importlib.import_module("astrbot_plugin_daily_care.main")
+    message_mod = _types.ModuleType("astrbot.core.agent.message")
+    class TextPart:
+        def __init__(self, text): self.text = text
+    class AssistantMessageSegment:
+        def __init__(self, content): self.content = content
+    message_mod.TextPart = TextPart
+    message_mod.AssistantMessageSegment = AssistantMessageSegment
+    message_mod.dump_messages_with_checkpoints = lambda messages: [
+        {"role": "assistant", "content": [{"type": "text", "text": messages[0].content[0].text}]}
+    ]
+    session_lock_mod = _types.ModuleType("astrbot.core.utils.session_lock")
+    class LockManager:
+        @contextlib.asynccontextmanager
+        async def acquire_lock(self, session_id): yield
+    session_lock_mod.session_lock_manager = LockManager()
+    names = {
+        "astrbot.core": _types.ModuleType("astrbot.core"),
+        "astrbot.core.agent": _types.ModuleType("astrbot.core.agent"),
+        "astrbot.core.agent.message": message_mod,
+        "astrbot.core.utils": _types.ModuleType("astrbot.core.utils"),
+        "astrbot.core.utils.session_lock": session_lock_mod,
+    }
+    old = {name: sys.modules.get(name) for name in names}
+    sys.modules.update(names)
+
+    class Conversation:
+        cid = "conversation-real"
+        history = "[]"
+    class Manager:
+        def __init__(self): self.calls = 0
+        async def get_conversation(self, umo, cid): return Conversation()
+        async def update_conversation(self, *args, **kwargs): self.calls += 1; raise RuntimeError("disk full")
+    class Event:
+        def __init__(self, care, context):
+            self.extra = {"daily_care": care, "daily_care_outcome": "send", "daily_care_delivered_text": "已发送正文", "daily_care_platform_sent": True}
+            self.context_obj = context; self.unified_msg_origin = "TestPlatform:FriendMessage:42"
+        def get_extra(self, key, default=None): return self.extra.get(key, default)
+        def set_extra(self, key, value): self.extra[key] = value
+
+    try:
+        db = make_db(); target_id = db.get_default_target()["id"]
+        event_id = db.add_event(target_id, "state", "计划事实", "详情", ttl_hours=72)
+        plan_id = db.add_plan(event_id, target_id, datetime.now().strftime("%Y-%m-%d"), "morning", "care", "计划事实")
+        assert db.mark_plan(plan_id, "processing") is True
+        manager = Manager(); context = _types.SimpleNamespace(conversation_manager=manager)
+        plugin = plugin_mod.DailyCarePlugin.__new__(plugin_mod.DailyCarePlugin)
+        plugin.db = db; plugin.context = context
+        plugin._executor = _types.SimpleNamespace(_last_send_key=lambda target, channel: f"last_{channel}_send_{target}")
+        care = {"kind": "wake", "wake_id": "history-fail", "target_id": target_id, "channel": "care", "plan_id": plan_id, "conversation_id": "conversation-real"}
+        event = Event(care, context)
+        asyncio.run(plugin._after_message_sent_care_wake(event))
+        asyncio.run(plugin._after_message_sent_care_wake(event))
+        assert manager.calls == 1
+        assert db.count_send_today(target_id, datetime.now().strftime("%Y-%m-%d"), "care") == 1
+        with db._connect() as conn:
+            row = conn.execute("SELECT status FROM care_plans WHERE id=?", (plan_id,)).fetchone()
+            assert row[0] == "sent"
+    finally:
+        for name, previous in old.items():
+            if previous is None: sys.modules.pop(name, None)
+            else: sys.modules[name] = previous
+    print("✓ 历史写回失败不重发且保持已发送状态测试通过")
 
 
 def test_weather_analyze():
@@ -1616,7 +1996,10 @@ if __name__ == "__main__":
     test_database()
     test_plan_and_send_lifecycle()
     test_wake_event_contract()
+    test_wake_requires_real_conversation()
     test_main_wake_hooks_and_scope()
+    test_wake_history_commit_is_platform_confirmed_and_idempotent()
+    test_wake_history_failure_does_not_resend_or_requeue()
     test_weather_analyze()
     test_chat_reflector()
     test_weather_judge()

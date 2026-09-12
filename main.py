@@ -37,7 +37,7 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PLUGIN_DIR, "data")
 
 
-@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.9")
+@register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.10")
 class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -513,7 +513,7 @@ class DailyCarePlugin(Star):
 
         for message in reversed(getattr(run_context, "messages", []) or []):
             if getattr(message, "role", "") == "assistant":
-                message.content = [] if no_save else [TextPart(text=text)]
+                message.content = [TextPart(text=text)] if text else []
                 message._no_save = no_save
                 return
 
@@ -535,10 +535,11 @@ class DailyCarePlugin(Star):
         if output is not None and output.action == "send":
             response.result_chain = None
             response.completion_text = output.message
-            self._set_final_assistant_message(run_context, output.message, no_save=False)
+            self._set_final_assistant_message(run_context, output.message, no_save=True)
             event.set_extra("daily_care_outcome", "send")
             event.set_extra("daily_care_delivered_text", output.message)
             event.set_extra("daily_care_committed", False)
+            event.set_extra("daily_care_history_commit_attempted", False)
             return
 
         outcome = "silent" if output is not None else "invalid"
@@ -572,6 +573,53 @@ class DailyCarePlugin(Star):
                 await self._mark_wake_skipped(event, care)
             result.chain = []
 
+    async def _append_care_history(self, event, care: dict, delivered: str) -> None:
+        """Append only the verified assistant body to the original conversation.
+
+        The Main Agent holds the same per-session lock while reading and saving
+        conversation history. Reusing it here prevents a concurrent user turn
+        from being overwritten by this post-send reconciliation.
+        """
+        from astrbot.core.agent.message import (
+            AssistantMessageSegment,
+            TextPart,
+            dump_messages_with_checkpoints,
+        )
+        from astrbot.core.utils.session_lock import session_lock_manager
+
+        context = getattr(event, "context_obj", None) or self.context
+        conv_mgr = getattr(context, "conversation_manager", None)
+        conversation_id = str(care.get("conversation_id") or "")
+        umo = str(
+            care.get("umo")
+            or getattr(event, "unified_msg_origin", "")
+            or ""
+        )
+        if conv_mgr is None or not conversation_id or not umo:
+            raise RuntimeError("original conversation metadata is unavailable")
+
+        async with session_lock_manager.acquire_lock(umo):
+            conversation = await conv_mgr.get_conversation(umo, conversation_id)
+            if conversation is None:
+                raise RuntimeError(f"original conversation not found: {conversation_id}")
+            history_raw = getattr(conversation, "history", "[]")
+            if isinstance(history_raw, str):
+                history = json.loads(history_raw)
+            else:
+                history = history_raw
+            if not isinstance(history, list):
+                raise ValueError("conversation history must be a list")
+
+            assistant = AssistantMessageSegment(
+                content=[TextPart(text=delivered)],
+            )
+            history.extend(dump_messages_with_checkpoints([assistant]))
+            await conv_mgr.update_conversation(
+                umo,
+                conversation_id,
+                history=history,
+            )
+
     @filter.after_message_sent()
     async def _after_message_sent_care_wake(self, event: AstrMessageEvent):
         care = self._care_wake_info(event)
@@ -579,13 +627,28 @@ class DailyCarePlugin(Star):
             return
         if event.get_extra("daily_care_committed"):
             return
-        if not getattr(event, "_has_send_oper", False):
+        if event.get_extra("daily_care_platform_sent") is not True:
             await self._mark_wake_skipped(event, care)
             return
         delivered = str(event.get_extra("daily_care_delivered_text") or "")
         if not delivered:
             await self._mark_wake_skipped(event, care)
             return
+
+        if not event.get_extra("daily_care_history_commit_attempted"):
+            # Guard before I/O: a hook retry must never append the same body a
+            # second time, even if the first persistence attempt failed.
+            event.set_extra("daily_care_history_commit_attempted", True)
+            try:
+                await self._append_care_history(event, care, delivered)
+            except Exception as e:
+                # The platform already accepted the message. This is a
+                # consistency error, not a reason to resend or requeue.
+                logger.error(
+                    f"[DailyCare] wake_id={care.get('wake_id', '')} 已发送但真实会话写回失败: {e}",
+                    exc_info=True,
+                )
+
         # Set the idempotency guard before any state mutation. AstrBot calls
         # this hook only once in normal operation; the flag protects retries.
         event.set_extra("daily_care_committed", True)

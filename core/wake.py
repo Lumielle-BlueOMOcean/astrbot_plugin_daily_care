@@ -36,6 +36,38 @@ from typing import Optional
 from astrbot.api import logger
 
 
+def _build_daily_care_wake_event(cron_event_cls):
+    """Build the runtime-specific wake event without importing AstrBot at module load.
+
+    The plugin's standalone tests intentionally do not install AstrBot. Keeping
+    this adapter lazy preserves that property while still overriding the
+    4.25.x CronMessageEvent send path at runtime.
+    """
+
+    class DailyCareWakeEvent(cron_event_cls):
+        async def send(self, message) -> None:
+            if message is None:
+                self.set_extra("daily_care_platform_sent", False)
+                return
+            try:
+                sent = await self.context_obj.send_message(self.session, message)
+            except Exception:
+                self.set_extra("daily_care_platform_sent", False)
+                raise
+
+            platform_sent = sent is True
+            self.set_extra("daily_care_platform_sent", platform_sent)
+            if platform_sent:
+                # CronMessageEvent.send() would call Context.send_message a
+                # second time. Jump directly to AstrMessageEvent's bookkeeping
+                # implementation so _has_send_oper remains an implementation
+                # detail rather than a delivery authority.
+                await super(cron_event_cls, self).send(message)
+
+    DailyCareWakeEvent.__name__ = "DailyCareWakeEvent"
+    return DailyCareWakeEvent
+
+
 class WakeChannel:
     """唤醒通道：把关怀事件交给 AstrBot 官方完整管线，由 bot 本人开口。"""
 
@@ -129,25 +161,46 @@ class WakeChannel:
             req.audio_urls = []
             recent_topic = ""
             try:
-                conv_mgr = self.context.conversation_manager
+                conv_mgr = getattr(self.context, "conversation_manager", None)
+                if conv_mgr is None:
+                    raise RuntimeError("conversation_manager unavailable")
+
                 cid = await conv_mgr.get_curr_conversation_id(umo)
                 if not cid:
                     cid = await conv_mgr.new_conversation(umo, session.platform_id)
+                if not cid:
+                    raise RuntimeError("conversation id unavailable")
+
                 conversation = await conv_mgr.get_conversation(umo, cid)
-                if not conversation:
-                    cid = await conv_mgr.new_conversation(umo, session.platform_id)
-                    conversation = await conv_mgr.get_conversation(umo, cid)
-                if conversation:
-                    req.conversation = conversation
-                    req.contexts = json.loads(conversation.history or "[]")
-                    # v1.1.5：仅冷场主动等需要话题接续的唤醒才提取；具体关怀不注入话题
-                    # v1.1.5 完善：recent_topic 注入做总开关（enable_recent_topic，
-                    # 默认关闭）——完整会话历史 + 长期记忆已足够支撑话题延续，
-                    # 摘要层默认移除，避免自我强化与复读；需要时可在面板开启。
-                    if with_topic and self.config.get("enable_recent_topic", False):
-                        recent_topic = self._extract_recent_topic(req.contexts)
+                if conversation is None:
+                    raise RuntimeError(f"conversation not found: {cid}")
+                conversation_id = str(getattr(conversation, "cid", "") or "")
+                if not conversation_id:
+                    raise RuntimeError("conversation id missing")
+
+                if not hasattr(conversation, "history"):
+                    raise ValueError("conversation history missing")
+                history_raw = conversation.history
+                if history_raw is None:
+                    raise ValueError("conversation history is null")
+                if isinstance(history_raw, str):
+                    contexts = json.loads(history_raw)
+                else:
+                    contexts = history_raw
+                if not isinstance(contexts, list):
+                    raise ValueError("conversation history must be a list")
+
+                req.conversation = conversation
+                req.contexts = contexts
+                # v1.1.5：仅冷场主动等需要话题接续的唤醒才提取；具体关怀不注入话题
+                # v1.1.5 完善：recent_topic 注入做总开关（enable_recent_topic，
+                # 默认关闭）——完整会话历史 + 长期记忆已足够支撑话题延续，
+                # 摘要层默认移除，避免自我强化与复读；需要时可在面板开启。
+                if with_topic and self.config.get("enable_recent_topic", False):
+                    recent_topic = self._extract_recent_topic(req.contexts)
             except Exception as e:
-                logger.warning(f"[DailyCare] 加载会话历史失败(将无历史唤醒): {e}")
+                logger.warning(f"[DailyCare] 加载真实会话失败，放弃本轮主动唤醒: {e}")
+                return False, ""
 
             # 本轮提示是临时认知：真实历史和其他插件上下文仍由 Main Agent
             # 正常管线提供，Daily Care 只追加本轮事实与协议边界。
@@ -176,7 +229,8 @@ class WakeChannel:
             note = "\n".join(why_lines)
             req.extra_user_content_parts.append(TextPart(text=note).mark_as_temp())
 
-            care_event = CronMessageEvent(
+            care_event_cls = _build_daily_care_wake_event(CronMessageEvent)
+            care_event = care_event_cls(
                 context=self.context,
                 session=session,
                 message="",
@@ -189,6 +243,8 @@ class WakeChannel:
                         "channel": channel,
                         "plan_id": int(plan_id or 0),
                         "wake_source": wake_source or channel,
+                        "conversation_id": conversation_id,
+                        "umo": umo,
                     },
                     "provider_request": req,
                 },
