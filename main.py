@@ -530,6 +530,14 @@ class DailyCarePlugin(Star):
         if plan_id:
             self.db.mark_plan(plan_id, "skipped")
 
+    @staticmethod
+    def _finalize_wake_tracker(event, tracker, wake_id: str, outcome: str) -> None:
+        """Notify WakeChannel once when the core event reaches a terminal hook."""
+        if tracker is None or event.get_extra("daily_care_tracker_finalized") is True:
+            return
+        event.set_extra("daily_care_tracker_finalized", True)
+        tracker.finalize_wake(wake_id, outcome)
+
     @filter.on_agent_done()
     async def _on_agent_done_care_wake(self, event: AstrMessageEvent, run_context, response):
         care = self._care_wake_info(event)
@@ -549,6 +557,11 @@ class DailyCarePlugin(Star):
             event.set_extra("daily_care_outcome", "invalid")
             event.set_extra("daily_care_delivered_text", "")
             await self._mark_wake_skipped(event, care)
+            if tracker is not None:
+                # Expiry/transport closure is not the same as core-event
+                # termination.  Clear the bounded WakeChannel barrier only
+                # when this terminal hook actually observes the old event.
+                self._finalize_wake_tracker(event, tracker, wake_id, "invalid")
             logger.warning(
                 f"[DailyCare] wake_id={wake_id} stage=agent_done outcome=invalid "
                 "reason=transport_already_closed"
@@ -587,7 +600,7 @@ class DailyCarePlugin(Star):
         await self._mark_wake_skipped(event, care)
         if tracker is not None:
             tracker.mark_stage(event, "agent_done")
-            tracker.finalize_wake(wake_id, outcome)
+            self._finalize_wake_tracker(event, tracker, wake_id, outcome)
         logger.info(
             f"[DailyCare] wake_id={wake_id} stage=agent_done outcome={outcome}"
         )
@@ -681,14 +694,17 @@ class DailyCarePlugin(Star):
         care = self._care_wake_info(event)
         if care is None:
             return
+        tracker = event.get_extra("daily_care_tracker")
+        wake_id = str(care.get("wake_id") or "")
         if event.get_extra("daily_care_finalized"):
+            if tracker is not None:
+                outcome = "sent" if event.get_extra("daily_care_platform_sent") is True else "invalid"
+                self._finalize_wake_tracker(event, tracker, wake_id, outcome)
             return
         if event.get_extra("daily_care_committed"):
             return
 
         outcome = event.get_extra("daily_care_outcome")
-        tracker = event.get_extra("daily_care_tracker")
-        wake_id = str(care.get("wake_id") or "")
         if outcome not in ("send", "silent", "invalid"):
             outcome = "invalid"
             event.set_extra("daily_care_outcome", outcome)
@@ -698,7 +714,7 @@ class DailyCarePlugin(Star):
             await self._mark_wake_skipped(event, care)
             event.set_extra("daily_care_finalized", True)
             if tracker is not None:
-                tracker.finalize_wake(wake_id, outcome)
+                self._finalize_wake_tracker(event, tracker, wake_id, outcome)
             logger.info(
                 f"[DailyCare] wake_id={care.get('wake_id', '')} "
                 f"stage=hook_finalized outcome={outcome}"
@@ -709,7 +725,7 @@ class DailyCarePlugin(Star):
             await self._mark_wake_skipped(event, care)
             event.set_extra("daily_care_finalized", True)
             if tracker is not None:
-                tracker.finalize_wake(wake_id, "skipped")
+                self._finalize_wake_tracker(event, tracker, wake_id, "skipped")
             logger.info(
                 f"[DailyCare] wake_id={care.get('wake_id', '')} "
                 "stage=hook_finalized outcome=send platform_sent=False"
@@ -720,7 +736,7 @@ class DailyCarePlugin(Star):
             await self._mark_wake_skipped(event, care)
             event.set_extra("daily_care_finalized", True)
             if tracker is not None:
-                tracker.finalize_wake(wake_id, "skipped")
+                self._finalize_wake_tracker(event, tracker, wake_id, "skipped")
             logger.info(
                 f"[DailyCare] wake_id={care.get('wake_id', '')} "
                 "stage=hook_finalized outcome=send delivered_empty=True"
@@ -752,7 +768,7 @@ class DailyCarePlugin(Star):
         if plan_id:
             self.db.mark_plan(plan_id, "sent")
         if tracker is not None:
-            tracker.finalize_wake(wake_id, "sent")
+            self._finalize_wake_tracker(event, tracker, wake_id, "sent")
         logger.info(
             f"[DailyCare] wake_id={wake_id} "
             "stage=hook_finalized outcome=send platform_sent=True"

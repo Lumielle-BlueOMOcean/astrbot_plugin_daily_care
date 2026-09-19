@@ -199,7 +199,12 @@ class WakeChannel:
         self._on_transport_failure = on_transport_failure
         self.wake_timeout_seconds = self.DEFAULT_WAKE_TIMEOUT_SECONDS
         self._wake_claim_lock = asyncio.Lock()
+        # A successful enqueue is a separate fact from the short-lived plugin
+        # admission claim.  The latter may expire while AstrBot's core event
+        # is still waiting for the session lock; keep one bounded barrier so
+        # the plugin cannot enqueue another event for the same UMO.
         self._wake_records: dict[str, dict] = {}
+        self._core_pending: dict[str, dict] = {}
 
     @staticmethod
     def _care_from_event(event) -> dict:
@@ -207,9 +212,14 @@ class WakeChannel:
         return care if isinstance(care, dict) else {}
 
     def _record_for_wake(self, wake_id: str):
-        for record in self._wake_records.values():
-            if record["wake_id"] == wake_id:
-                return record
+        seen = set()
+        for records in (self._wake_records, self._core_pending):
+            for record in records.values():
+                if id(record) in seen:
+                    continue
+                seen.add(id(record))
+                if record["wake_id"] == wake_id:
+                    return record
         return None
 
     @staticmethod
@@ -224,7 +234,19 @@ class WakeChannel:
         if record is None:
             return
         self._cancel_timeout(record)
-        self._wake_records.pop(record["umo"], None)
+        if self._wake_records.get(record["umo"]) is record:
+            self._wake_records.pop(record["umo"], None)
+        if self._core_pending.get(record["umo"]) is record:
+            self._core_pending.pop(record["umo"], None)
+
+    def _release_plugin_claim(self, wake_id: str) -> None:
+        """Release admission without claiming the core event has ended."""
+        record = self._record_for_wake(wake_id)
+        if record is None:
+            return
+        self._cancel_timeout(record)
+        if self._wake_records.get(record["umo"]) is record:
+            self._wake_records.pop(record["umo"], None)
 
     def mark_stage(self, event, stage: str) -> None:
         care = self._care_from_event(event)
@@ -261,7 +283,14 @@ class WakeChannel:
 
     def cancel_all(self) -> None:
         """Cancel in-memory wake claims when the plugin is terminating."""
-        for record in list(self._wake_records.values()):
+        records = []
+        seen = set()
+        for pending in (self._wake_records, self._core_pending):
+            for record in pending.values():
+                if id(record) not in seen:
+                    seen.add(id(record))
+                    records.append(record)
+        for record in records:
             event = record["event"]
             wake_id = record["wake_id"]
             if event.get_extra("daily_care_platform_sent") is True:
@@ -291,6 +320,10 @@ class WakeChannel:
         if record is None:
             return
         event = record["event"]
+        if event.get_extra("daily_care_platform_sent") is True:
+            # Delivery is already authoritative; let the normal after-send
+            # hook close the core-pending record instead of downgrading it.
+            return
         event.set_extra("daily_care_expired", True)
         event.set_extra("daily_care_outcome", "invalid")
         event.set_extra("daily_care_delivered_text", "")
@@ -301,19 +334,24 @@ class WakeChannel:
         clear_result = getattr(event, "_clear_result", None)
         if callable(clear_result):
             clear_result()
-        self._release_wake(wake_id)
+        # The plugin claim is expired, but the event remains in AstrBot's
+        # queue until a terminal hook or transport failure observes it.
+        self._release_plugin_claim(wake_id)
         logger.warning(
             f"[DailyCare] wake_id={wake_id} stage=wake_expired "
-            f"timeout_seconds={self.wake_timeout_seconds}"
+            f"timeout_seconds={self.wake_timeout_seconds} core_pending=True"
         )
 
     async def _claim_wake(self, umo: str, wake_id: str, event) -> bool:
         async with self._wake_claim_lock:
             current = self._wake_records.get(umo)
-            if current is not None:
+            core_pending = self._core_pending.get(umo)
+            if current is not None or core_pending is not None:
+                existing = current or core_pending
+                reason = "unfinished_wake" if current is not None else "core_wake_pending"
                 logger.info(
                     f"[DailyCare] wake_id={wake_id} stage=wake_rejected "
-                    f"reason=unfinished_wake existing_wake_id={current['wake_id']}"
+                    f"reason={reason} existing_wake_id={existing['wake_id']}"
                 )
                 return False
             record = {
@@ -324,6 +362,7 @@ class WakeChannel:
                 "timeout_task": None,
             }
             self._wake_records[umo] = record
+            self._core_pending[umo] = record
             event.set_extra("daily_care_state", "queued")
             record["timeout_task"] = asyncio.create_task(
                 self._expire_wake_after(wake_id),
