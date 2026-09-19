@@ -163,7 +163,7 @@ def _build_daily_care_wake_event(cron_event_cls):
                     f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
                     f"stage=platform_failed error_type={type(exc).__name__}"
                 )
-                return
+                raise
 
             platform_sent = sent is True
             self.set_extra("daily_care_platform_sent", platform_sent)

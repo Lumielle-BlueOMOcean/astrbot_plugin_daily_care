@@ -446,7 +446,12 @@ def test_wake_event_contract():
             ctx.send_calls += 1
             raise RuntimeError("platform unavailable")
         ctx.send_message = raise_send
-        asyncio.run(exception_event.send(CoreMessageChain([CorePlain("body")])))
+        try:
+            asyncio.run(exception_event.send(CoreMessageChain([CorePlain("body")])))
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("platform exception must propagate")
         assert exception_event.get_extra("daily_care_platform_sent") is False
         assert exception_event.get_extra("daily_care_transport_consumed") is not True
         assert asyncio.run(WakeChannel(ctx, {}).wake(
