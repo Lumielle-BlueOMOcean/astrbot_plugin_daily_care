@@ -472,6 +472,9 @@ class DailyCarePlugin(Star):
             care = event.get_extra("daily_care")
             if not isinstance(care, dict) or care.get("kind") != "wake":
                 return
+            logger.info(
+                f"[DailyCare] wake_id={care.get('wake_id', '')} stage=agent_running"
+            )
             request.func_tool = None
             event.set_extra("daily_care_tools_disabled", True)
             # AstrBot 4.25.5 may expose the attachment sentinel after
@@ -540,6 +543,9 @@ class DailyCarePlugin(Star):
             event.set_extra("daily_care_delivered_text", output.message)
             event.set_extra("daily_care_committed", False)
             event.set_extra("daily_care_history_commit_attempted", False)
+            logger.info(
+                f"[DailyCare] wake_id={wake_id} stage=agent_done outcome=send"
+            )
             return
 
         outcome = "silent" if output is not None else "invalid"
@@ -554,6 +560,9 @@ class DailyCarePlugin(Star):
         event.set_extra("daily_care_outcome", outcome)
         event.set_extra("daily_care_delivered_text", "")
         await self._mark_wake_skipped(event, care)
+        logger.info(
+            f"[DailyCare] wake_id={wake_id} stage=agent_done outcome={outcome}"
+        )
 
     @filter.on_decorating_result()
     async def _on_decorating_result_care_wake(self, event: AstrMessageEvent):
@@ -576,17 +585,17 @@ class DailyCarePlugin(Star):
     async def _append_care_history(self, event, care: dict, delivered: str) -> None:
         """Append only the verified assistant body to the original conversation.
 
-        The Main Agent holds the same per-session lock while reading and saving
-        conversation history. Reusing it here prevents a concurrent user turn
-        from being overwritten by this post-send reconciliation.
+        AstrBot 4.28.0 holds the same per-session lock through
+        OnAfterMessageSentEvent. This helper is called from that protected
+        hook, so acquiring the core lock again would self-deadlock. The
+        enclosing core lock serializes this read/append/update with the next
+        normal user turn.
         """
         from astrbot.core.agent.message import (
             AssistantMessageSegment,
             TextPart,
             dump_messages_with_checkpoints,
         )
-        from astrbot.core.utils.session_lock import session_lock_manager
-
         context = getattr(event, "context_obj", None) or self.context
         conv_mgr = getattr(context, "conversation_manager", None)
         conversation_id = str(care.get("conversation_id") or "")
@@ -598,7 +607,12 @@ class DailyCarePlugin(Star):
         if conv_mgr is None or not conversation_id or not umo:
             raise RuntimeError("original conversation metadata is unavailable")
 
-        async with session_lock_manager.acquire_lock(umo):
+        wake_id = str(care.get("wake_id") or "")
+        logger.info(
+            f"[DailyCare] wake_id={wake_id} stage=history_write_start "
+            f"conversation_id={conversation_id}"
+        )
+        try:
             conversation = await conv_mgr.get_conversation(umo, conversation_id)
             if conversation is None:
                 raise RuntimeError(f"original conversation not found: {conversation_id}")
@@ -619,6 +633,17 @@ class DailyCarePlugin(Star):
                 conversation_id,
                 history=history,
             )
+        except Exception as e:
+            logger.error(
+                f"[DailyCare] wake_id={wake_id} stage=history_write_failed "
+                f"conversation_id={conversation_id} error_type={type(e).__name__}",
+                exc_info=True,
+            )
+            raise
+        logger.info(
+            f"[DailyCare] wake_id={wake_id} stage=history_write_ok "
+            f"conversation_id={conversation_id}"
+        )
 
     @filter.after_message_sent()
     async def _after_message_sent_care_wake(self, event: AstrMessageEvent):
@@ -639,16 +664,28 @@ class DailyCarePlugin(Star):
         if outcome in ("silent", "invalid"):
             await self._mark_wake_skipped(event, care)
             event.set_extra("daily_care_finalized", True)
+            logger.info(
+                f"[DailyCare] wake_id={care.get('wake_id', '')} "
+                f"stage=hook_finalized outcome={outcome}"
+            )
             return
 
         if event.get_extra("daily_care_platform_sent") is not True:
             await self._mark_wake_skipped(event, care)
             event.set_extra("daily_care_finalized", True)
+            logger.info(
+                f"[DailyCare] wake_id={care.get('wake_id', '')} "
+                "stage=hook_finalized outcome=send platform_sent=False"
+            )
             return
         delivered = str(event.get_extra("daily_care_delivered_text") or "")
         if not delivered:
             await self._mark_wake_skipped(event, care)
             event.set_extra("daily_care_finalized", True)
+            logger.info(
+                f"[DailyCare] wake_id={care.get('wake_id', '')} "
+                "stage=hook_finalized outcome=send delivered_empty=True"
+            )
             return
 
         if not event.get_extra("daily_care_history_commit_attempted"):
@@ -657,13 +694,10 @@ class DailyCarePlugin(Star):
             event.set_extra("daily_care_history_commit_attempted", True)
             try:
                 await self._append_care_history(event, care, delivered)
-            except Exception as e:
+            except Exception:
                 # The platform already accepted the message. This is a
                 # consistency error, not a reason to resend or requeue.
-                logger.error(
-                    f"[DailyCare] wake_id={care.get('wake_id', '')} 已发送但真实会话写回失败: {e}",
-                    exc_info=True,
-                )
+                pass
 
         # Set the idempotency guard before any state mutation. AstrBot calls
         # this hook only once in normal operation; the flag protects retries.
@@ -678,7 +712,10 @@ class DailyCarePlugin(Star):
         self.db.kv_set("last_activity_ts", now)
         if plan_id:
             self.db.mark_plan(plan_id, "sent")
-        logger.info(f"[DailyCare] Main Agent 主动消息已实际发送（wake_id={care.get('wake_id', '')}）")
+        logger.info(
+            f"[DailyCare] wake_id={care.get('wake_id', '')} "
+            "stage=hook_finalized outcome=send platform_sent=True"
+        )
 
     # ---------- 聊天入口 ----------
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)

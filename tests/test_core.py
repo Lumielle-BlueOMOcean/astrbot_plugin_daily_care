@@ -701,11 +701,16 @@ def test_wake_history_commit_is_platform_confirmed_and_idempotent():
     session_lock_mod = _types.ModuleType("astrbot.core.utils.session_lock")
 
     class LockManager:
+        def __init__(self):
+            self.lock = asyncio.Lock()
+
         @contextlib.asynccontextmanager
         async def acquire_lock(self, session_id):
-            yield
+            async with self.lock:
+                yield
 
-    session_lock_mod.session_lock_manager = LockManager()
+    lock_manager = LockManager()
+    session_lock_mod.session_lock_manager = lock_manager
     names = {
         "astrbot.core": _types.ModuleType("astrbot.core"),
         "astrbot.core.agent": _types.ModuleType("astrbot.core.agent"),
@@ -782,7 +787,25 @@ def test_wake_history_commit_is_platform_confirmed_and_idempotent():
         assert run_context.messages[1]._no_save is True
         assert run_context.messages[1].content[0].text == "午饭吃了吗？"
         event.set_extra("daily_care_platform_sent", True)
-        asyncio.run(plugin._after_message_sent_care_wake(event))
+
+        async def run_wake_pipeline_then_normal_message():
+            normal_turn_acquired = asyncio.Event()
+
+            async def normal_message_turn():
+                async with lock_manager.acquire_lock(event.unified_msg_origin):
+                    normal_turn_acquired.set()
+
+            async with lock_manager.acquire_lock(event.unified_msg_origin):
+                hook_task = asyncio.create_task(
+                    plugin._after_message_sent_care_wake(event)
+                )
+                normal_task = asyncio.create_task(normal_message_turn())
+                await asyncio.wait_for(hook_task, timeout=0.5)
+                assert not normal_task.done()
+            await asyncio.wait_for(normal_task, timeout=0.5)
+            assert normal_turn_acquired.is_set()
+
+        asyncio.run(run_wake_pipeline_then_normal_message())
         asyncio.run(plugin._after_message_sent_care_wake(event))
         history = json.loads(manager.conversation.history)
         assert history == [
