@@ -154,7 +154,7 @@ jobs:
           PY
 
       - name: Install runtime smoke dependencies
-        run: python -m pip install --disable-pip-version-check -r ci/runtime-smoke-requirements.txt
+        run: python -m pip install --disable-pip-version-check -r ci/runtime-smoke-requirements-428.txt
 
       - name: Run AstrBot 4.28.0 runtime smoke
         env:
