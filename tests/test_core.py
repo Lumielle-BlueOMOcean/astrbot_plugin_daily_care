@@ -149,6 +149,25 @@ def test_plan_and_send_lifecycle():
     assert db2.mark_plan(plan3, "processing") is True
     assert db2.recover_processing_plans() == 1
     assert db2.get_pending_plans(today)[0]["id"] == plan3
+
+    # 同一 UMO 已有未完成 wake 时，新的 due plan 入队被拒绝后必须结束为
+    # skipped，不能永久停在 processing。
+    db3 = make_db()
+    target3 = db3.get_default_target()
+    event4 = db3.add_event(target3["id"], "state", "阻塞期间事实", "详情", ttl_hours=72)
+    plan4 = db3.add_plan(
+        event4, target3["id"], today, "morning", "care", "阻塞期间事实",
+    )
+    with db3._connect() as conn:
+        conn.execute("UPDATE care_plans SET trigger_ts=? WHERE id=?", (int(time.time()) - 1, plan4))
+    ex3 = Executor(db3, {"silence_exclude_window_min": 0}, FakeContext(), None)
+    ex3.in_dnd = lambda: False
+    async def rejected_wake(*args, **kwargs):
+        return False, ""
+    ex3._woke_for_care = rejected_wake
+    assert asyncio.run(ex3.execute_due_plans()) == []
+    with db3._connect() as conn:
+        assert conn.execute("SELECT status FROM care_plans WHERE id=?", (plan4,)).fetchone()[0] == "skipped"
     print("✓ 入队/实际发送/计划状态生命周期测试通过")
 
 
@@ -246,8 +265,11 @@ def test_wake_event_contract():
     sys.modules.update(fake_modules)
 
     class Queue:
-        def __init__(self): self.items = []
-        async def put(self, event): self.items.append(event)
+        def __init__(self): self.items = []; self.fail = False
+        async def put(self, event):
+            if self.fail:
+                raise RuntimeError("queue unavailable")
+            self.items.append(event)
 
     class Conversation:
         cid = "conversation-1"
@@ -269,7 +291,8 @@ def test_wake_event_contract():
 
     try:
         ctx = Ctx()
-        ok, wake_id = asyncio.run(WakeChannel(ctx, {}).wake(
+        wake_channel = WakeChannel(ctx, {})
+        ok, wake_id = asyncio.run(wake_channel.wake(
             "TestPlatform:FriendMessage:42", "天气事实", target_id=7,
             channel="weather", wake_source="weather",
         ))
@@ -283,6 +306,11 @@ def test_wake_event_contract():
         assert event.extras["provider_request"].extra_user_content_parts[0]._no_save is True
         event.context_obj = ctx
         event.session = Session()
+        # 同一 UMO 的前一条 wake 未完成时，后续定时触发不能继续积压。
+        assert asyncio.run(wake_channel.wake(
+            "TestPlatform:FriendMessage:42", "另一条事实", channel="weather",
+            wake_source="weather",
+        )) == (False, "")
         ctx.send_result = True
         ctx.send_calls = 0
         async def send_message(session, chain):
@@ -300,9 +328,13 @@ def test_wake_event_contract():
         assert ctx.send_calls == 1
         assert event.get_extra("daily_care_platform_sent") is True
 
-        assert asyncio.run(WakeChannel(ctx, {}).wake(
-            "TestPlatform:FriendMessage:42", "天气事实", channel="weather", wake_source="weather"
+        # 完整终态释放后才允许同一 UMO 的下一条 wake 入队。
+        wake_channel.finalize_wake(wake_id, "sent")
+        assert asyncio.run(wake_channel.wake(
+            "TestPlatform:FriendMessage:42", "下一条事实", channel="weather",
+            wake_source="weather",
         ))[0] is True
+
         event_false = ctx.queue.items.pop()
         event_false.context_obj = ctx
         event_false.session = Session()
@@ -371,17 +403,52 @@ def test_wake_event_contract():
             ctx.send_calls += 1
             raise RuntimeError("platform unavailable")
         ctx.send_message = raise_send
-        try:
-            asyncio.run(exception_event.send(CoreMessageChain([CorePlain("body")])))
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("platform exception must propagate")
+        asyncio.run(exception_event.send(CoreMessageChain([CorePlain("body")])))
         assert exception_event.get_extra("daily_care_platform_sent") is False
         assert exception_event.get_extra("daily_care_transport_consumed") is not True
         assert asyncio.run(WakeChannel(ctx, {}).wake(
             "TestPlatform:FriendMessage:42", "", channel="care"
         )) == (False, "")
+
+        # 超时 wake 不得在恢复后突然发送；超时后新 wake 可以重新入队。
+        async def run_expiry_and_cancel_scenario():
+            expiring = WakeChannel(ctx, {})
+            expiring.wake_timeout_seconds = 0.01
+            assert (await expiring.wake(
+                "TestPlatform:FriendMessage:99", "天气事实", channel="weather",
+                wake_source="weather",
+            ))[0] is True
+            expired_event = ctx.queue.items.pop()
+            expired_event.context_obj = ctx
+            expired_event.session = Session()
+            await asyncio.sleep(0.03)
+            assert expired_event.get_extra("daily_care_expired") is True
+            expired_event.set_extra("daily_care_outcome", "send")
+            expired_event.set_extra("daily_care_delivered_text", "body")
+            before_expired_send = ctx.send_calls
+            await expired_event.send(CoreMessageChain([CorePlain("body")]))
+            assert ctx.send_calls == before_expired_send
+            assert expired_event.get_extra("daily_care_outcome") == "invalid"
+            assert (await expiring.wake(
+                "TestPlatform:FriendMessage:99", "恢复后的事实", channel="weather",
+                wake_source="weather",
+            ))[0] is True
+            expiring.cancel_all()
+            assert (await expiring.wake(
+                "TestPlatform:FriendMessage:99", "取消后的事实", channel="weather",
+                wake_source="weather",
+            ))[0] is True
+            expiring.cancel_all()
+            failing = WakeChannel(ctx, {})
+            ctx.queue.fail = True
+            assert (await failing.wake(
+                "TestPlatform:FriendMessage:100", "入队失败事实", channel="weather",
+                wake_source="weather",
+            )) == (False, "")
+            assert failing._wake_records == {}
+            ctx.queue.fail = False
+
+        asyncio.run(run_expiry_and_cancel_scenario())
     finally:
         for name, previous in old.items():
             if previous is None:
@@ -537,9 +604,16 @@ def test_main_wake_hooks_and_scope():
     class Result:
         def __init__(self): self.chain = ["raw"]
 
+    class Tracker:
+        def __init__(self): self.stages = []; self.finalized = []
+        def mark_stage(self, event, stage): self.stages.append(stage)
+        def finalize_wake(self, wake_id, outcome): self.finalized.append((wake_id, outcome))
+
     class Event:
-        def __init__(self, care):
+        def __init__(self, care, tracker=None):
             self.extra = {"daily_care": care, "daily_care_platform_sent": True}
+            if tracker is not None:
+                self.extra["daily_care_tracker"] = tracker
             self.result = Result()
             self._has_send_oper = True
 
@@ -569,7 +643,8 @@ def test_main_wake_hooks_and_scope():
             RuntimeMessage("assistant", [RuntimeTextPart("envelope")]),
         ])
         response = Response('{"action":"send","message":"午饭吃了吗？"}')
-        event = Event(care)
+        tracker = Tracker()
+        event = Event(care, tracker)
         asyncio.run(plugin._on_agent_done_care_wake(event, run_context, response))
         assert response.completion_text == "午饭吃了吗？"
         assert response.result_chain is None
@@ -581,6 +656,7 @@ def test_main_wake_hooks_and_scope():
         assert event.get_result().chain[0].text == "午饭吃了吗？"
         asyncio.run(plugin._after_message_sent_care_wake(event))
         asyncio.run(plugin._after_message_sent_care_wake(event))
+        assert tracker.finalized == [("hook-1", "sent")]
         assert db.count_send_today(target_id, datetime.now().strftime("%Y-%m-%d"), "care") == 1
         assert db.get_recent_reminders(target_id)[0] == "午饭吃了吗？"
 

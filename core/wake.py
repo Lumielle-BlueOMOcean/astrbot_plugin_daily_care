@@ -29,6 +29,7 @@ v5.3 改进（用户指出唤醒消息未延续上下文）：
 - 上层（executor / decision）只依赖 WakeChannel.wake()，不感知内部实现。
 - AstrBot 升级时，本文件是唯一需要检查/修复的点。
 """
+import asyncio
 import json
 import uuid
 from typing import Optional
@@ -45,6 +46,14 @@ def _build_daily_care_wake_event(cron_event_cls):
     """
 
     class DailyCareWakeEvent(cron_event_cls):
+        def _wake_tracker(self):
+            return self.get_extra("daily_care_tracker")
+
+        def _mark_wake_stage(self, stage: str) -> None:
+            tracker = self._wake_tracker()
+            if tracker is not None:
+                tracker.mark_stage(self, stage)
+
         def _clear_result(self) -> None:
             try:
                 make_result = getattr(self, "make_result", None)
@@ -77,6 +86,7 @@ def _build_daily_care_wake_event(cron_event_cls):
             self.set_extra("daily_care_platform_sent", False)
             self.set_extra("daily_care_outcome", "invalid")
             self.set_extra("daily_care_delivered_text", "")
+            self._mark_wake_stage("rejected")
             self._clear_result()
             logger.warning(
                 f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
@@ -107,6 +117,9 @@ def _build_daily_care_wake_event(cron_event_cls):
             return True, ""
 
         async def send(self, message) -> None:
+            if self.get_extra("daily_care_expired") is True:
+                self._reject_transport("wake expired")
+                return
             if self.get_extra("daily_care_finalized") is True:
                 logger.warning(
                     f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
@@ -134,15 +147,25 @@ def _build_daily_care_wake_event(cron_event_cls):
 
             try:
                 sent = await self.context_obj.send_message(self.session, message)
-            except Exception:
+            except Exception as exc:
                 self.set_extra("daily_care_platform_sent", False)
                 self.set_extra("daily_care_outcome", "invalid")
                 self.set_extra("daily_care_delivered_text", "")
+                self._mark_wake_stage("platform_failed")
                 self._clear_result()
-                raise
+                logger.warning(
+                    f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
+                    f"stage=platform_failed error_type={type(exc).__name__}"
+                )
+                return
 
             platform_sent = sent is True
             self.set_extra("daily_care_platform_sent", platform_sent)
+            self._mark_wake_stage("platform_sent" if platform_sent else "platform_failed")
+            logger.info(
+                f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
+                f"stage=platform_result sent={platform_sent}"
+            )
             if platform_sent:
                 self.set_extra("daily_care_transport_consumed", True)
                 # CronMessageEvent.send() would call Context.send_message a
@@ -158,9 +181,129 @@ def _build_daily_care_wake_event(cron_event_cls):
 class WakeChannel:
     """唤醒通道：把关怀事件交给 AstrBot 官方完整管线，由 bot 本人开口。"""
 
+    DEFAULT_WAKE_TIMEOUT_SECONDS = 15 * 60
+
     def __init__(self, context, config: Optional[dict] = None):
         self.context = context
         self.config = config or {}
+        self.wake_timeout_seconds = self.DEFAULT_WAKE_TIMEOUT_SECONDS
+        self._wake_claim_lock = asyncio.Lock()
+        self._wake_records: dict[str, dict] = {}
+
+    @staticmethod
+    def _care_from_event(event) -> dict:
+        care = event.get_extra("daily_care")
+        return care if isinstance(care, dict) else {}
+
+    def _record_for_wake(self, wake_id: str):
+        for record in self._wake_records.values():
+            if record["wake_id"] == wake_id:
+                return record
+        return None
+
+    @staticmethod
+    def _cancel_timeout(record: dict) -> None:
+        timeout_task = record.get("timeout_task")
+        if timeout_task is not None and not timeout_task.done():
+            if timeout_task is not asyncio.current_task():
+                timeout_task.cancel()
+
+    def _release_wake(self, wake_id: str) -> None:
+        record = self._record_for_wake(wake_id)
+        if record is None:
+            return
+        self._cancel_timeout(record)
+        self._wake_records.pop(record["umo"], None)
+
+    def mark_stage(self, event, stage: str) -> None:
+        care = self._care_from_event(event)
+        wake_id = str(care.get("wake_id") or "")
+        record = self._record_for_wake(wake_id)
+        if record is not None:
+            record["state"] = stage
+        if callable(getattr(event, "set_extra", None)):
+            event.set_extra("daily_care_state", stage)
+
+    def finalize_wake(self, wake_id: str, outcome: str) -> None:
+        """Release exactly one wake claim after its official pipeline terminal state."""
+        record = self._record_for_wake(wake_id)
+        if record is None:
+            return
+        event = record["event"]
+        if event.get_extra("daily_care_platform_sent") is True:
+            outcome = "sent"
+        record["state"] = outcome
+        event.set_extra("daily_care_state", outcome)
+        self._release_wake(wake_id)
+        logger.info(
+            f"[DailyCare] wake_id={wake_id} stage=wake_finalized outcome={outcome}"
+        )
+
+    def cancel_all(self) -> None:
+        """Cancel in-memory wake claims when the plugin is terminating."""
+        for record in list(self._wake_records.values()):
+            event = record["event"]
+            wake_id = record["wake_id"]
+            if event.get_extra("daily_care_platform_sent") is True:
+                self.finalize_wake(wake_id, "sent")
+                continue
+            event.set_extra("daily_care_expired", True)
+            event.set_extra("daily_care_outcome", "invalid")
+            event.set_extra("daily_care_delivered_text", "")
+            event.set_extra("daily_care_state", "cancelled")
+            clear_result = getattr(event, "_clear_result", None)
+            if callable(clear_result):
+                clear_result()
+            self._release_wake(wake_id)
+            logger.info(
+                f"[DailyCare] wake_id={wake_id} stage=wake_finalized outcome=cancelled"
+            )
+
+    async def _expire_wake_after(self, wake_id: str) -> None:
+        try:
+            await asyncio.sleep(self.wake_timeout_seconds)
+        except asyncio.CancelledError:
+            return
+        record = self._record_for_wake(wake_id)
+        if record is None:
+            return
+        event = record["event"]
+        event.set_extra("daily_care_expired", True)
+        event.set_extra("daily_care_outcome", "invalid")
+        event.set_extra("daily_care_delivered_text", "")
+        event.set_extra("daily_care_state", "expired")
+        clear_result = getattr(event, "_clear_result", None)
+        if callable(clear_result):
+            clear_result()
+        self._release_wake(wake_id)
+        logger.warning(
+            f"[DailyCare] wake_id={wake_id} stage=wake_expired "
+            f"timeout_seconds={self.wake_timeout_seconds}"
+        )
+
+    async def _claim_wake(self, umo: str, wake_id: str, event) -> bool:
+        async with self._wake_claim_lock:
+            current = self._wake_records.get(umo)
+            if current is not None:
+                logger.info(
+                    f"[DailyCare] wake_id={wake_id} stage=wake_rejected "
+                    f"reason=unfinished_wake existing_wake_id={current['wake_id']}"
+                )
+                return False
+            record = {
+                "wake_id": wake_id,
+                "umo": umo,
+                "event": event,
+                "state": "queued",
+                "timeout_task": None,
+            }
+            self._wake_records[umo] = record
+            event.set_extra("daily_care_state", "queued")
+            record["timeout_task"] = asyncio.create_task(
+                self._expire_wake_after(wake_id),
+                name=f"daily_care_wake_timeout:{wake_id}",
+            )
+            return True
 
     @staticmethod
     def _extract_recent_topic(contexts, max_rounds: int = 2, max_chars: int = 200) -> str:
@@ -333,13 +476,21 @@ class WakeChannel:
                         "conversation_id": conversation_id,
                         "umo": umo,
                     },
+                    "daily_care_tracker": self,
                     "provider_request": req,
                 },
                 message_type=session.message_type,
             )
-            await self.context.get_event_queue().put(care_event)
+            if not await self._claim_wake(umo, wake_id, care_event):
+                return False, ""
+            try:
+                await self.context.get_event_queue().put(care_event)
+            except Exception:
+                self.finalize_wake(wake_id, "enqueue_failed")
+                raise
             logger.info(
-                f"[DailyCare] 主动唤醒已入队，等待 Main Agent 自主决定是否开口（wake_id={wake_id}）"
+                f"[DailyCare] wake_id={wake_id} stage=wake_enqueued "
+                "等待 Main Agent 自主决定是否开口"
             )
             return True, wake_id
         except Exception as e:

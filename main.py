@@ -140,6 +140,8 @@ class DailyCarePlugin(Star):
     async def terminate(self):
         for t in self._tasks:
             t.cancel()
+        if self._executor is not None:
+            self._executor.wake_channel.cancel_all()
         logger.info("[DailyCare] 日常关怀插件已停止")
 
     # ---------- 人格加载 ----------
@@ -475,6 +477,9 @@ class DailyCarePlugin(Star):
             logger.info(
                 f"[DailyCare] wake_id={care.get('wake_id', '')} stage=agent_running"
             )
+            tracker = event.get_extra("daily_care_tracker")
+            if tracker is not None:
+                tracker.mark_stage(event, "running")
             request.func_tool = None
             event.set_extra("daily_care_tools_disabled", True)
             # AstrBot 4.25.5 may expose the attachment sentinel after
@@ -531,6 +536,21 @@ class DailyCarePlugin(Star):
         if care is None:
             return
         wake_id = str(care.get("wake_id") or "")
+        tracker = event.get_extra("daily_care_tracker")
+        if event.get_extra("daily_care_expired") is True:
+            if response is not None:
+                response.result_chain = None
+                response.completion_text = ""
+            self._mark_temp_wake_user(run_context)
+            self._set_final_assistant_message(run_context, "", no_save=True)
+            event.set_extra("daily_care_outcome", "invalid")
+            event.set_extra("daily_care_delivered_text", "")
+            await self._mark_wake_skipped(event, care)
+            logger.warning(
+                f"[DailyCare] wake_id={wake_id} stage=agent_done outcome=invalid "
+                "reason=expired"
+            )
+            return
         raw = getattr(response, "completion_text", "") if response is not None else ""
         output = parse_wake_output(raw or "")
         self._mark_temp_wake_user(run_context)
@@ -543,6 +563,8 @@ class DailyCarePlugin(Star):
             event.set_extra("daily_care_delivered_text", output.message)
             event.set_extra("daily_care_committed", False)
             event.set_extra("daily_care_history_commit_attempted", False)
+            if tracker is not None:
+                tracker.mark_stage(event, "agent_done")
             logger.info(
                 f"[DailyCare] wake_id={wake_id} stage=agent_done outcome=send"
             )
@@ -560,6 +582,9 @@ class DailyCarePlugin(Star):
         event.set_extra("daily_care_outcome", outcome)
         event.set_extra("daily_care_delivered_text", "")
         await self._mark_wake_skipped(event, care)
+        if tracker is not None:
+            tracker.mark_stage(event, "agent_done")
+            tracker.finalize_wake(wake_id, outcome)
         logger.info(
             f"[DailyCare] wake_id={wake_id} stage=agent_done outcome={outcome}"
         )
@@ -656,6 +681,8 @@ class DailyCarePlugin(Star):
             return
 
         outcome = event.get_extra("daily_care_outcome")
+        tracker = event.get_extra("daily_care_tracker")
+        wake_id = str(care.get("wake_id") or "")
         if outcome not in ("send", "silent", "invalid"):
             outcome = "invalid"
             event.set_extra("daily_care_outcome", outcome)
@@ -664,6 +691,8 @@ class DailyCarePlugin(Star):
         if outcome in ("silent", "invalid"):
             await self._mark_wake_skipped(event, care)
             event.set_extra("daily_care_finalized", True)
+            if tracker is not None:
+                tracker.finalize_wake(wake_id, outcome)
             logger.info(
                 f"[DailyCare] wake_id={care.get('wake_id', '')} "
                 f"stage=hook_finalized outcome={outcome}"
@@ -673,6 +702,8 @@ class DailyCarePlugin(Star):
         if event.get_extra("daily_care_platform_sent") is not True:
             await self._mark_wake_skipped(event, care)
             event.set_extra("daily_care_finalized", True)
+            if tracker is not None:
+                tracker.finalize_wake(wake_id, "skipped")
             logger.info(
                 f"[DailyCare] wake_id={care.get('wake_id', '')} "
                 "stage=hook_finalized outcome=send platform_sent=False"
@@ -682,6 +713,8 @@ class DailyCarePlugin(Star):
         if not delivered:
             await self._mark_wake_skipped(event, care)
             event.set_extra("daily_care_finalized", True)
+            if tracker is not None:
+                tracker.finalize_wake(wake_id, "skipped")
             logger.info(
                 f"[DailyCare] wake_id={care.get('wake_id', '')} "
                 "stage=hook_finalized outcome=send delivered_empty=True"
@@ -712,8 +745,10 @@ class DailyCarePlugin(Star):
         self.db.kv_set("last_activity_ts", now)
         if plan_id:
             self.db.mark_plan(plan_id, "sent")
+        if tracker is not None:
+            tracker.finalize_wake(wake_id, "sent")
         logger.info(
-            f"[DailyCare] wake_id={care.get('wake_id', '')} "
+            f"[DailyCare] wake_id={wake_id} "
             "stage=hook_finalized outcome=send platform_sent=True"
         )
 
