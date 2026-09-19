@@ -250,6 +250,9 @@ def test_wake_event_contract():
         def get_result(self):
             return self._result
 
+        def cleanup_temporary_local_files(self):
+            return None
+
     fake_modules = {
         "astrbot.core": _types.ModuleType("astrbot.core"),
         "astrbot.core.agent": _types.ModuleType("astrbot.core.agent"),
@@ -365,6 +368,7 @@ def test_wake_event_contract():
         asyncio.run(error_event.send(CoreMessageChain([
             CorePlain("Error occurred while processing agent request: test")
         ])))
+        error_event.cleanup_temporary_local_files()
         assert ctx.send_calls == before_error_send
         assert error_event.get_extra("daily_care_outcome") == "invalid"
         assert error_event.get_extra("daily_care_finalized") is True
@@ -386,6 +390,7 @@ def test_wake_event_contract():
         event_false.set_extra("daily_care_delivered_text", "body")
         ctx.send_result = False
         asyncio.run(event_false.send(CoreMessageChain([CorePlain("body")])))
+        event_false.cleanup_temporary_local_files()
         assert event_false.get_extra("daily_care_platform_sent") is False
         assert event_false._has_send_oper is True
         assert ctx.send_calls == 2
@@ -507,9 +512,7 @@ def test_wake_event_contract():
             assert expired_event.get_extra("daily_care_outcome") == "invalid"
 
             # 旧核心事件最终退出管线后才解除 barrier；随后新 wake 才可入队。
-            expiring.finalize_wake(
-                expired_event.get_extra("daily_care")["wake_id"], "invalid"
-            )
+            expired_event.cleanup_temporary_local_files()
             assert (await expiring.wake(
                 "TestPlatform:FriendMessage:99", "恢复后的事实", channel="weather",
                 wake_source="weather",
@@ -621,6 +624,168 @@ def test_wake_requires_real_conversation():
             if previous is None: sys.modules.pop(name, None)
             else: sys.modules[name] = previous
     print("✓ 真实 conversation 缺失/损坏时 fail closed 测试通过")
+
+
+def test_wake_barrier_releases_only_after_core_cleanup():
+    """核心锁释放后，scheduler cleanup 才能解除 wake barrier。"""
+    from core.wake import WakeChannel, _build_daily_care_wake_event
+
+    class CronEvent:
+        def __init__(self, **kwargs):
+            self.extras = kwargs.get("extras", {})
+
+        def get_extra(self, key, default=None):
+            return self.extras.get(key, default)
+
+        def set_extra(self, key, value):
+            self.extras[key] = value
+
+        def cleanup_temporary_local_files(self):
+            return None
+
+    class Queue:
+        async def put(self, event):
+            self.event = event
+
+    class Context:
+        def __init__(self):
+            self.queue = Queue()
+
+        def get_event_queue(self):
+            return self.queue
+
+    async def scenario():
+        context = Context()
+        channel = WakeChannel(context, {})
+        event_cls = _build_daily_care_wake_event(CronEvent)
+        event = event_cls(
+            context=context,
+            session="TestPlatform:FriendMessage:terminal",
+            message="",
+            extras={
+                "daily_care": {
+                    "kind": "wake",
+                    "wake_id": "terminal-1",
+                    "umo": "TestPlatform:FriendMessage:terminal",
+                },
+                "daily_care_tracker": channel,
+            },
+        )
+        umo = "TestPlatform:FriendMessage:terminal"
+        assert await channel._claim_wake(umo, "terminal-1", event)
+        event.set_extra("daily_care_outcome", "silent")
+
+        core_lock = asyncio.Lock()
+        async with core_lock:
+            # This models OnAgentDone/RespondStage running while the real
+            # InternalAgentSubStage still owns the session lock.
+            assert umo in channel._core_pending
+        # AstrBot's scheduler finally runs cleanup only after the stage has
+        # unwound and released the core session lock.
+        event.cleanup_temporary_local_files()
+        assert umo not in channel._core_pending
+
+        async with core_lock:
+            pass
+
+    asyncio.run(scenario())
+    print("✓ wake barrier core cleanup 终态测试通过")
+
+
+def test_wake_pipeline_terminal_lifecycle_and_user_recovery():
+    """验证真实异步时序下的 send/silent/expiry 终态与真人锁恢复。"""
+    from core.wake import WakeChannel, _build_daily_care_wake_event
+
+    class CronEvent:
+        def __init__(self, **kwargs):
+            self.extras = kwargs.get("extras", {})
+
+        def get_extra(self, key, default=None):
+            return self.extras.get(key, default)
+
+        def set_extra(self, key, value):
+            self.extras[key] = value
+
+        def cleanup_temporary_local_files(self):
+            return None
+
+    class Context:
+        pass
+
+    async def scenario():
+        context = Context()
+        event_cls = _build_daily_care_wake_event(CronEvent)
+        core_lock = asyncio.Lock()
+
+        def make_event(channel, wake_id):
+            return event_cls(
+                context=context,
+                session="TestPlatform:FriendMessage:lifecycle",
+                message="",
+                extras={
+                    "daily_care": {
+                        "kind": "wake",
+                        "wake_id": wake_id,
+                        "umo": "TestPlatform:FriendMessage:lifecycle",
+                    },
+                    "daily_care_tracker": channel,
+                },
+            )
+
+        # SEND: agent/after-send work occurs while the core lock is held;
+        # another wake remains rejected until scheduler cleanup after unlock.
+        channel = WakeChannel(context, {})
+        first = make_event(channel, "send-a")
+        umo = "TestPlatform:FriendMessage:lifecycle"
+        assert await channel._claim_wake(umo, "send-a", first)
+        async with core_lock:
+            first.set_extra("daily_care_outcome", "send")
+            first.set_extra("daily_care_platform_sent", True)
+            second = make_event(channel, "send-b")
+            assert not await channel._claim_wake(umo, "send-b", second)
+        first.cleanup_temporary_local_files()
+        assert await channel._claim_wake(umo, "send-b", second)
+        channel.cancel_all()
+
+        # SILENT: no after-message hook is required; scheduler cleanup still
+        # releases the barrier and the next normal user turn acquires its lock.
+        silent_channel = WakeChannel(context, {})
+        silent = make_event(silent_channel, "silent-a")
+        assert await silent_channel._claim_wake(umo, "silent-a", silent)
+        async with core_lock:
+            silent.set_extra("daily_care_outcome", "silent")
+            assert umo in silent_channel._core_pending
+        silent.cleanup_temporary_local_files()
+        silent.cleanup_temporary_local_files()
+        assert umo not in silent_channel._core_pending
+        user_acquired = asyncio.Event()
+
+        async def normal_user_turn():
+            async with core_lock:
+                user_acquired.set()
+
+        await asyncio.wait_for(normal_user_turn(), timeout=0.5)
+        assert user_acquired.is_set()
+
+        # EXPIRY: several timeout-equivalent triggers cannot enqueue while
+        # the original core event remains pending. Cleanup then drops the
+        # expired event without making its stale result deliverable.
+        expiring = WakeChannel(context, {})
+        expiring.wake_timeout_seconds = 0.005
+        expired = make_event(expiring, "expired-a")
+        assert await expiring._claim_wake(umo, "expired-a", expired)
+        await asyncio.sleep(0.02)
+        assert umo not in expiring._wake_records
+        assert umo in expiring._core_pending
+        for index in range(3):
+            later = make_event(expiring, f"expired-b-{index}")
+            assert not await expiring._claim_wake(umo, f"expired-b-{index}", later)
+        expired.cleanup_temporary_local_files()
+        assert umo not in expiring._core_pending
+        expiring.cancel_all()
+
+    asyncio.run(scenario())
+    print("✓ wake pipeline 终态/沉默/过期/真人恢复测试通过")
 
 
 def test_main_wake_hooks_and_scope():
@@ -737,7 +902,10 @@ def test_main_wake_hooks_and_scope():
         assert event.get_result().chain[0].text == "午饭吃了吗？"
         asyncio.run(plugin._after_message_sent_care_wake(event))
         asyncio.run(plugin._after_message_sent_care_wake(event))
-        assert tracker.finalized == [("hook-1", "sent")]
+        # Result/after-send hooks run before AstrBot's scheduler finally
+        # releases the InternalAgentSubStage session lock.  Core barrier
+        # finalization is intentionally deferred to event cleanup.
+        assert tracker.finalized == []
         assert db.count_send_today(target_id, datetime.now().strftime("%Y-%m-%d"), "care") == 1
         assert db.get_recent_reminders(target_id)[0] == "午饭吃了吗？"
 
@@ -745,13 +913,15 @@ def test_main_wake_hooks_and_scope():
             RuntimeMessage("user", [RuntimeTextPart("temporary")]),
             RuntimeMessage("assistant", [RuntimeTextPart("raw")]),
         ])
-        bad_event = Event(care)
+        bad_tracker = Tracker()
+        bad_event = Event(care, bad_tracker)
         bad_response = Response("14:27。今天已经六条了，一条没回，所以这条按住不发。")
         asyncio.run(plugin._on_agent_done_care_wake(bad_event, bad_context, bad_response))
         assert bad_response.completion_text == ""
         assert bad_context.messages[0]._no_save is True
         assert bad_context.messages[1]._no_save is True
         assert bad_event.get_extra("daily_care_outcome") == "invalid"
+        assert bad_tracker.finalized == []
         asyncio.run(plugin._on_decorating_result_care_wake(bad_event))
         assert bad_event.get_result().chain == []
 
@@ -2296,6 +2466,8 @@ if __name__ == "__main__":
     test_database()
     test_plan_and_send_lifecycle()
     test_wake_event_contract()
+    test_wake_barrier_releases_only_after_core_cleanup()
+    test_wake_pipeline_terminal_lifecycle_and_user_recovery()
     test_wake_requires_real_conversation()
     test_main_wake_hooks_and_scope()
     test_wake_history_commit_is_platform_confirmed_and_idempotent()

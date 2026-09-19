@@ -70,6 +70,48 @@ def _build_daily_care_wake_event(cron_event_cls):
                     f"清理拒绝发送结果失败: {exc}"
                 )
 
+        def _finalize_after_core_cleanup(self) -> None:
+            """Release the core-pending barrier at AstrBot's real pipeline end.
+
+            AstrBot's PipelineScheduler calls ``cleanup_temporary_local_files``
+            from its ``finally`` block, after InternalAgentSubStage has
+            unwound the session-lock context.  Agent/after-send hooks are
+            therefore result/transport boundaries, not core-pipeline
+            boundaries.
+            """
+            tracker = self._wake_tracker()
+            if tracker is None or self.get_extra("daily_care_tracker_finalized") is True:
+                return
+            care = self.get_extra("daily_care") or {}
+            wake_id = str(care.get("wake_id") or "")
+            if self.get_extra("daily_care_platform_sent") is True:
+                outcome = "sent"
+            else:
+                outcome = self.get_extra("daily_care_outcome")
+                if outcome not in ("silent", "invalid"):
+                    outcome = "invalid"
+            logger.info(
+                f"[DailyCare] wake_id={wake_id} stage=core_pipeline_cleanup "
+                f"outcome={outcome}"
+            )
+            tracker.finalize_wake(wake_id, outcome)
+            self.set_extra("daily_care_tracker_finalized", True)
+
+        def cleanup_temporary_local_files(self) -> None:
+            """Finalize DailyCare only after AstrBot's scheduler is unwound."""
+            try:
+                self._finalize_after_core_cleanup()
+            except Exception as exc:
+                logger.error(
+                    f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
+                    f"核心管线终态清理失败 error_type={type(exc).__name__}",
+                    exc_info=True,
+                )
+            finally:
+                cleanup = getattr(super(), "cleanup_temporary_local_files", None)
+                if callable(cleanup):
+                    cleanup()
+
         def _reject_transport(self, reason: str) -> None:
             # A successful delivery is final. A later framework/plugin call
             # must not downgrade it or clear the already-authorized body.
@@ -258,13 +300,13 @@ class WakeChannel:
             event.set_extra("daily_care_state", stage)
 
     def transport_failed(self, event, reason: str) -> None:
-        """Close a wake when transport fails before after-message hooks can run."""
-        care = self._care_from_event(event)
-        wake_id = str(care.get("wake_id") or "")
+        """Mark transport failure; core barrier closes at scheduler cleanup."""
         event.set_extra("daily_care_finalized", True)
+        event.set_extra("daily_care_outcome", "invalid")
+        event.set_extra("daily_care_delivered_text", "")
+        self.mark_stage(event, "transport_failed")
         if callable(self._on_transport_failure):
             self._on_transport_failure(event, reason)
-        self.finalize_wake(wake_id, "invalid")
 
     def finalize_wake(self, wake_id: str, outcome: str) -> None:
         """Release exactly one wake claim after its official pipeline terminal state."""

@@ -163,6 +163,7 @@ async def _run_expiry_and_lock_smoke(event_cls) -> None:
     channel.wake_timeout_seconds = 0.01
     umo = "ci:FriendMessage:99"
     first_event = _new_event(event_cls, context, "pending", outcome="send", delivered="过期正文")
+    first_event.set_extra("daily_care_tracker", channel)
     _assert(await channel._claim_wake(umo, "pending", first_event), "first wake was not claimed")
     await asyncio.sleep(0.03)
     _assert(umo not in channel._wake_records, "plugin claim was not released")
@@ -196,8 +197,43 @@ async def _run_expiry_and_lock_smoke(event_cls) -> None:
     _assert(first_event.get_extra("daily_care_outcome") == "invalid", "expired wake not invalid")
     print("PASS: expired wake suppressed after recovery")
 
-    channel.finalize_wake("pending", "invalid")
+    first_event.cleanup_temporary_local_files()
     _assert(umo not in channel._core_pending, "terminal wake did not clear barrier")
+    print("PASS: expired wake core cleanup released barrier")
+
+
+async def _run_silent_cleanup_smoke(event_cls) -> None:
+    """Verify silent wake cleanup after the real session-lock scope ends."""
+    context = CountingContext(True)
+    channel = WakeChannel(context)
+    umo = "ci:FriendMessage:100"
+    event = _new_event(event_cls, context, "silent", outcome="silent")
+    event.set_extra("daily_care_tracker", channel)
+    _assert(await channel._claim_wake(umo, "silent", event), "silent wake was not claimed")
+
+    async with session_lock_manager.acquire_lock(umo):
+        _assert(umo in channel._core_pending, "silent barrier disappeared inside core lock")
+        later = _new_event(event_cls, context, "silent-later")
+        later.set_extra("daily_care_tracker", channel)
+        _assert(
+            not await channel._claim_wake(umo, "silent-later", later),
+            "later wake entered while silent core event was still active",
+        )
+
+    event.cleanup_temporary_local_files()
+    event.cleanup_temporary_local_files()
+    _assert(umo not in channel._core_pending, "silent cleanup did not clear barrier")
+
+    lock_recovered = asyncio.Event()
+
+    async def normal_user_turn():
+        async with session_lock_manager.acquire_lock(umo):
+            lock_recovered.set()
+
+    await asyncio.wait_for(normal_user_turn(), timeout=0.5)
+    _assert(lock_recovered.is_set(), "normal user lock did not recover after cleanup")
+    channel.cancel_all()
+    print("PASS: silent cleanup and normal user lock recovery")
 
 
 async def _run_smoke() -> None:
@@ -207,12 +243,20 @@ async def _run_smoke() -> None:
 
     internal_source = inspect.getsource(InternalAgentSubStage.process)
     respond_source = inspect.getsource(RespondStage.process)
+    scheduler_source = (
+        ASTRBOT_SOURCE / "astrbot/core/pipeline/scheduler.py"
+    ).read_text(encoding="utf-8")
     _assert("session_lock_manager.acquire_lock" in internal_source, "4.28 lock scope changed")
     _assert("yield" in internal_source, "4.28 agent stage is not downstream-yielding")
     _assert("OnAfterMessageSentEvent" in respond_source, "4.28 after-send hook path changed")
+    _assert(
+        "finally" in scheduler_source and "cleanup_temporary_local_files" in scheduler_source,
+        "4.28 scheduler cleanup boundary changed",
+    )
     print("PASS: 4.28 session lock and after-send hook shape")
 
     await _run_transport_smoke(event_cls)
+    await _run_silent_cleanup_smoke(event_cls)
     await _run_expiry_and_lock_smoke(event_cls)
 
 
