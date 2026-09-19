@@ -168,6 +168,18 @@ def test_plan_and_send_lifecycle():
     assert asyncio.run(ex3.execute_due_plans()) == []
     with db3._connect() as conn:
         assert conn.execute("SELECT status FROM care_plans WHERE id=?", (plan4,)).fetchone()[0] == "skipped"
+
+    event5 = db3.add_event(target3["id"], "state", "框架错误事实", "详情", ttl_hours=72)
+    plan5 = db3.add_plan(event5, target3["id"], today, "noon", "care", "框架错误事实")
+    assert db3.mark_plan(plan5, "processing") is True
+    failed_event = type("FailedWakeEvent", (), {
+        "get_extra": lambda self, key, default=None: {
+            "daily_care": {"kind": "wake", "wake_id": "framework-error", "plan_id": plan5}
+        }.get(key, default)
+    })()
+    ex3._on_wake_transport_failure(failed_event, "framework error")
+    with db3._connect() as conn:
+        assert conn.execute("SELECT status FROM care_plans WHERE id=?", (plan5,)).fetchone()[0] == "skipped"
     print("✓ 入队/实际发送/计划状态生命周期测试通过")
 
 
@@ -291,7 +303,13 @@ def test_wake_event_contract():
 
     try:
         ctx = Ctx()
-        wake_channel = WakeChannel(ctx, {})
+        transport_failures = []
+        wake_channel = WakeChannel(
+            ctx, {},
+            on_transport_failure=lambda event, reason: transport_failures.append(
+                (event.get_extra("daily_care")["wake_id"], reason)
+            ),
+        )
         ok, wake_id = asyncio.run(wake_channel.wake(
             "TestPlatform:FriendMessage:42", "天气事实", target_id=7,
             channel="weather", wake_source="weather",
@@ -327,6 +345,31 @@ def test_wake_event_contract():
         asyncio.run(event.send(CoreMessageChain([CorePlain("body")])))
         assert ctx.send_calls == 1
         assert event.get_extra("daily_care_platform_sent") is True
+
+        # InternalAgentSubStage 的错误路径可能在 after_message_sent hook
+        # 之前直接调用 event.send；transport failure 自身必须完成收尾。
+        error_channel = WakeChannel(
+            ctx, {},
+            on_transport_failure=lambda event, reason: transport_failures.append(
+                (event.get_extra("daily_care")["wake_id"], reason)
+            ),
+        )
+        assert asyncio.run(error_channel.wake(
+            "TestPlatform:FriendMessage:43", "错误路径事实", channel="care",
+            wake_source="care",
+        ))[0] is True
+        error_event = ctx.queue.items.pop()
+        error_event.context_obj = ctx
+        error_event.session = Session()
+        before_error_send = ctx.send_calls
+        asyncio.run(error_event.send(CoreMessageChain([
+            CorePlain("Error occurred while processing agent request: test")
+        ])))
+        assert ctx.send_calls == before_error_send
+        assert error_event.get_extra("daily_care_outcome") == "invalid"
+        assert error_event.get_extra("daily_care_finalized") is True
+        assert error_channel._wake_records == {}
+        assert transport_failures[-1][0] == error_event.get_extra("daily_care")["wake_id"]
 
         # 完整终态释放后才允许同一 UMO 的下一条 wake 入队。
         wake_channel.finalize_wake(wake_id, "sent")

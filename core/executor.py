@@ -44,11 +44,26 @@ class Executor:
         self.llm_func = llm_func      # 保留（备用，不再用于直发）
         self.persona_prompt = persona_prompt or ""
         self.session = session        # 默认发送会话（unified_msg_origin）
-        self.wake_channel = WakeChannel(context, config)
+        self.wake_channel = WakeChannel(
+            context, config, on_transport_failure=self._on_wake_transport_failure
+        )
         # v1.1.7：平台实例动态解析缓存与失败计数（不再锁死、不再兜底）
         self._pid_cache = ""
         self._pid_cache_ts = 0.0
         self._pid_fail_count = 0
+
+    def _on_wake_transport_failure(self, event, reason: str) -> None:
+        """Finalize plan state when a wake fails before after-message hooks."""
+        care = event.get_extra("daily_care")
+        if not isinstance(care, dict) or care.get("kind") != "wake":
+            return
+        plan_id = int(care.get("plan_id") or 0)
+        if plan_id:
+            self.db.mark_plan(plan_id, "skipped")
+        logger.warning(
+            f"[DailyCare] wake_id={care.get('wake_id', '')} "
+            f"stage=wake_terminal outcome=invalid reason={reason}"
+        )
 
     # ---------- 时间判定 ----------
     def in_dnd(self) -> bool:

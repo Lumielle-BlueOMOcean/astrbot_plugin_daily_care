@@ -87,6 +87,9 @@ def _build_daily_care_wake_event(cron_event_cls):
             self.set_extra("daily_care_outcome", "invalid")
             self.set_extra("daily_care_delivered_text", "")
             self._mark_wake_stage("rejected")
+            tracker = self._wake_tracker()
+            if tracker is not None:
+                tracker.transport_failed(self, reason)
             self._clear_result()
             logger.warning(
                 f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
@@ -152,6 +155,9 @@ def _build_daily_care_wake_event(cron_event_cls):
                 self.set_extra("daily_care_outcome", "invalid")
                 self.set_extra("daily_care_delivered_text", "")
                 self._mark_wake_stage("platform_failed")
+                tracker = self._wake_tracker()
+                if tracker is not None:
+                    tracker.transport_failed(self, "platform exception")
                 self._clear_result()
                 logger.warning(
                     f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
@@ -173,6 +179,10 @@ def _build_daily_care_wake_event(cron_event_cls):
                 # implementation so _has_send_oper remains an implementation
                 # detail rather than a delivery authority.
                 await super(cron_event_cls, self).send(message)
+            else:
+                tracker = self._wake_tracker()
+                if tracker is not None:
+                    tracker.transport_failed(self, "platform returned false")
 
     DailyCareWakeEvent.__name__ = "DailyCareWakeEvent"
     return DailyCareWakeEvent
@@ -183,9 +193,10 @@ class WakeChannel:
 
     DEFAULT_WAKE_TIMEOUT_SECONDS = 15 * 60
 
-    def __init__(self, context, config: Optional[dict] = None):
+    def __init__(self, context, config: Optional[dict] = None, on_transport_failure=None):
         self.context = context
         self.config = config or {}
+        self._on_transport_failure = on_transport_failure
         self.wake_timeout_seconds = self.DEFAULT_WAKE_TIMEOUT_SECONDS
         self._wake_claim_lock = asyncio.Lock()
         self._wake_records: dict[str, dict] = {}
@@ -224,6 +235,15 @@ class WakeChannel:
         if callable(getattr(event, "set_extra", None)):
             event.set_extra("daily_care_state", stage)
 
+    def transport_failed(self, event, reason: str) -> None:
+        """Close a wake when transport fails before after-message hooks can run."""
+        care = self._care_from_event(event)
+        wake_id = str(care.get("wake_id") or "")
+        event.set_extra("daily_care_finalized", True)
+        if callable(self._on_transport_failure):
+            self._on_transport_failure(event, reason)
+        self.finalize_wake(wake_id, "invalid")
+
     def finalize_wake(self, wake_id: str, outcome: str) -> None:
         """Release exactly one wake claim after its official pipeline terminal state."""
         record = self._record_for_wake(wake_id)
@@ -251,6 +271,9 @@ class WakeChannel:
             event.set_extra("daily_care_outcome", "invalid")
             event.set_extra("daily_care_delivered_text", "")
             event.set_extra("daily_care_state", "cancelled")
+            event.set_extra("daily_care_finalized", True)
+            if callable(self._on_transport_failure):
+                self._on_transport_failure(event, "wake cancelled")
             clear_result = getattr(event, "_clear_result", None)
             if callable(clear_result):
                 clear_result()
@@ -272,6 +295,9 @@ class WakeChannel:
         event.set_extra("daily_care_outcome", "invalid")
         event.set_extra("daily_care_delivered_text", "")
         event.set_extra("daily_care_state", "expired")
+        event.set_extra("daily_care_finalized", True)
+        if callable(self._on_transport_failure):
+            self._on_transport_failure(event, "wake expired")
         clear_result = getattr(event, "_clear_result", None)
         if callable(clear_result):
             clear_result()

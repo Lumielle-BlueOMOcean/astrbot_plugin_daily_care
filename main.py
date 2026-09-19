@@ -537,7 +537,10 @@ class DailyCarePlugin(Star):
             return
         wake_id = str(care.get("wake_id") or "")
         tracker = event.get_extra("daily_care_tracker")
-        if event.get_extra("daily_care_expired") is True:
+        if (
+            event.get_extra("daily_care_expired") is True
+            or event.get_extra("daily_care_finalized") is True
+        ):
             if response is not None:
                 response.result_chain = None
                 response.completion_text = ""
@@ -548,7 +551,7 @@ class DailyCarePlugin(Star):
             await self._mark_wake_skipped(event, care)
             logger.warning(
                 f"[DailyCare] wake_id={wake_id} stage=agent_done outcome=invalid "
-                "reason=expired"
+                "reason=transport_already_closed"
             )
             return
         raw = getattr(response, "completion_text", "") if response is not None else ""
@@ -597,6 +600,9 @@ class DailyCarePlugin(Star):
         outcome = event.get_extra("daily_care_outcome")
         result = event.get_result()
         if result is None:
+            return
+        if event.get_extra("daily_care_finalized") is True:
+            result.chain = []
             return
         if outcome == "send":
             from astrbot.api.message_components import Plain
