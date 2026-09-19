@@ -458,7 +458,8 @@ def test_wake_event_contract():
             "TestPlatform:FriendMessage:42", "", channel="care"
         )) == (False, "")
 
-        # 超时 wake 不得在恢复后突然发送；超时后新 wake 可以重新入队。
+        # 超时只释放插件 claim，不能撤销已经进入核心队列的旧 wake。
+        # 在同一 UMO 的核心事件仍未结束时，跨越多个超时周期也不得继续积压。
         async def run_expiry_and_cancel_scenario():
             expiring = WakeChannel(ctx, {})
             expiring.wake_timeout_seconds = 0.01
@@ -466,17 +467,49 @@ def test_wake_event_contract():
                 "TestPlatform:FriendMessage:99", "天气事实", channel="weather",
                 wake_source="weather",
             ))[0] is True
-            expired_event = ctx.queue.items.pop()
+            queue_start = len(ctx.queue.items)
+            expired_event = ctx.queue.items[-1]
             expired_event.context_obj = ctx
             expired_event.session = Session()
             await asyncio.sleep(0.03)
             assert expired_event.get_extra("daily_care_expired") is True
+
+            core_session_lock = asyncio.Lock()
+            await core_session_lock.acquire()
+            user_turn_acquired = asyncio.Event()
+
+            async def normal_user_turn():
+                async with core_session_lock:
+                    user_turn_acquired.set()
+
+            normal_user_task = asyncio.create_task(normal_user_turn())
+            await asyncio.sleep(0)
+            assert not normal_user_task.done()
+            core_session_lock.release()
+            await asyncio.wait_for(normal_user_task, timeout=0.5)
+            assert user_turn_acquired.is_set()
+
+            # 三个后续定时触发横跨多个 15 分钟等价超时周期；核心队列仍只能
+            # 保留最初的那一条，不能把插件 claim 超时误当成核心事件结束。
+            for facts in ("第二条事实", "第三条事实", "第四条事实"):
+                await asyncio.sleep(0.03)
+                assert await expiring.wake(
+                    "TestPlatform:FriendMessage:99", facts, channel="weather",
+                    wake_source="weather",
+                ) == (False, "")
+                assert len(ctx.queue.items) == queue_start
+
             expired_event.set_extra("daily_care_outcome", "send")
             expired_event.set_extra("daily_care_delivered_text", "body")
             before_expired_send = ctx.send_calls
             await expired_event.send(CoreMessageChain([CorePlain("body")]))
             assert ctx.send_calls == before_expired_send
             assert expired_event.get_extra("daily_care_outcome") == "invalid"
+
+            # 旧核心事件最终退出管线后才解除 barrier；随后新 wake 才可入队。
+            expiring.finalize_wake(
+                expired_event.get_extra("daily_care")["wake_id"], "invalid"
+            )
             assert (await expiring.wake(
                 "TestPlatform:FriendMessage:99", "恢复后的事实", channel="weather",
                 wake_source="weather",
