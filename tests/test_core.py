@@ -6,6 +6,7 @@
 """
 import asyncio
 import hashlib
+import importlib
 import json
 import os
 import shutil
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime
+from pathlib import Path
 
 # ---- 注入假的 astrbot 运行时（仅测试用）----
 import types
@@ -307,6 +309,93 @@ def test_upgrade_preflight_detects_legacy_writes_after_snapshot():
     assert protected.kv_get("before_snapshot") == {"value": 1}
     assert protected.kv_get("after_snapshot") is None
     print("✓ 旧库快照后写入阻断测试通过")
+
+
+def test_upgrade_preflight_wal_and_harmless_shm_change():
+    """WAL 数据完整迁移，SHM 读状态变化不应被视为业务写入。"""
+    from scripts.prepare_upgrade import _database_fingerprint, prepare_upgrade
+
+    root = tempfile.mkdtemp(prefix="daily_care_upgrade_wal_shm_test_")
+    legacy_dir = os.path.join(root, "data", "plugins", "astrbot_plugin_daily_care", "data")
+    legacy = CareDatabase(legacy_dir)
+    legacy_path = os.path.join(legacy_dir, "daily_care.db")
+    wal_conn = sqlite3.connect(legacy_path)
+    wal_conn.execute("PRAGMA journal_mode=WAL")
+    wal_conn.execute(
+        "INSERT INTO kv(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ("wal_preflight", json.dumps({"value": "committed"}, ensure_ascii=False)),
+    )
+    wal_conn.commit()
+    assert os.path.exists(legacy_path + "-wal")
+    assert os.path.exists(legacy_path + "-shm")
+
+    before = _database_fingerprint(legacy_path)
+    with open(legacy_path + "-shm", "rb") as handle:
+        before_shm = hashlib.sha256(handle.read()).hexdigest()
+    protected_dir = prepare_upgrade(root, core_stopped=True)
+    protected = CareDatabase(protected_dir)
+    assert protected.kv_get("wal_preflight") == {"value": "committed"}
+
+    after = _database_fingerprint(legacy_path)
+    with open(legacy_path + "-shm", "rb") as handle:
+        after_shm = hashlib.sha256(handle.read()).hexdigest()
+    assert before_shm != after_shm
+    assert before.get("database") == after.get("database")
+    assert before.get("-wal") == after.get("-wal")
+
+    auxiliary_reader = sqlite3.connect(legacy_path)
+    auxiliary_reader.execute("BEGIN")
+    auxiliary_reader.execute("SELECT COUNT(*) FROM kv").fetchone()
+    auxiliary_reader.commit()
+
+    assert prepare_upgrade(root, core_stopped=True) == protected_dir
+    assert CareDatabase(protected_dir).kv_get("wal_preflight") == {"value": "committed"}
+    auxiliary_reader.close()
+    wal_conn.close()
+    print("✓ WAL/SHM 迁移与无害辅助文件变化测试通过")
+
+
+def test_upgrade_preflight_manifest_failure_has_recovery_path():
+    """保护记录写入失败时保留两份数据库，并可通过内容核验恢复。"""
+    from core.database import DatabaseMigrationError
+
+    upgrade = importlib.import_module("scripts.prepare_upgrade")
+    root = tempfile.mkdtemp(prefix="daily_care_upgrade_manifest_failure_")
+    legacy_dir = os.path.join(root, "data", "plugins", "astrbot_plugin_daily_care", "data")
+    legacy = CareDatabase(legacy_dir)
+    legacy.kv_set("manifest_failure", {"value": "preserved"})
+    legacy_path = os.path.join(legacy_dir, "daily_care.db")
+    standard_path = os.path.join(
+        root, "data", "plugin_data", "astrbot_plugin_daily_care", "daily_care.db"
+    )
+
+    original_write_manifest = upgrade._write_manifest
+
+    def fail_write_manifest(*args, **kwargs):
+        raise DatabaseMigrationError("simulated protection record failure")
+
+    upgrade._write_manifest = fail_write_manifest
+    try:
+        try:
+            upgrade.prepare_upgrade(root, core_stopped=True)
+        except DatabaseMigrationError as exc:
+            assert "simulated" in str(exc)
+        else:
+            raise AssertionError("保护记录写入失败未阻止升级")
+    finally:
+        upgrade._write_manifest = original_write_manifest
+
+    assert os.path.exists(standard_path)
+    assert os.path.exists(legacy_path)
+    assert not os.path.exists(os.path.join(os.path.dirname(standard_path), upgrade.MIGRATION_MANIFEST))
+    assert CareDatabase(os.path.dirname(standard_path)).kv_get("manifest_failure") == {
+        "value": "preserved"
+    }
+
+    assert upgrade.prepare_upgrade(root, core_stopped=True) == Path(standard_path).parent.resolve()
+    assert os.path.exists(os.path.join(os.path.dirname(standard_path), upgrade.MIGRATION_MANIFEST))
+    print("✓ 保护记录失败保留与恢复测试通过")
 
 
 def test_geoip_never_uses_sync_fallback():
@@ -2729,6 +2818,8 @@ if __name__ == "__main__":
     test_upgrade_preflight_requires_database_and_reports_error()
     test_upgrade_preflight_requires_stopped_core_for_legacy_database()
     test_upgrade_preflight_detects_legacy_writes_after_snapshot()
+    test_upgrade_preflight_wal_and_harmless_shm_change()
+    test_upgrade_preflight_manifest_failure_has_recovery_path()
     test_geoip_never_uses_sync_fallback()
     test_plan_and_send_lifecycle()
     test_wake_event_contract()

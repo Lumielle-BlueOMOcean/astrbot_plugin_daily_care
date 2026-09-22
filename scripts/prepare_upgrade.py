@@ -26,6 +26,7 @@ from core.database import (
     DatabaseMigrationError,
     _has_sqlite_sidecar,
     _is_valid_sqlite_database,
+    _sqlite_uri,
     prepare_data_dir,
 )
 
@@ -40,9 +41,15 @@ def _database_artifact_exists(database_path: Path) -> bool:
 
 
 def _database_fingerprint(database_path: Path) -> dict[str, str]:
-    """Hash the database and SQLite sidecars to detect post-backup writes."""
+    """Hash SQLite files that can carry committed database changes.
+
+    The WAL can contain committed changes not yet checkpointed into the main
+    file.  SHM and rollback-journal files are SQLite coordination/temporary
+    state and can change during a read or backup without changing business
+    data, so they are intentionally excluded.
+    """
     result: dict[str, str] = {}
-    for suffix in ("", "-wal", "-shm", "-journal"):
+    for suffix in ("", "-wal"):
         path = Path(f"{database_path}{suffix}")
         if not path.is_file():
             continue
@@ -52,6 +59,25 @@ def _database_fingerprint(database_path: Path) -> dict[str, str]:
                 digest.update(chunk)
         result[suffix or "database"] = digest.hexdigest()
     return result
+
+
+def _logical_database_fingerprint(database_path: Path) -> str:
+    """Return a deterministic business-data hash for safe recovery checks.
+
+    ``CareDatabase`` may reseed an existing database during startup, which can
+    advance SQLite's internal ``sqlite_sequence`` without changing any user
+    record.  That implementation detail is excluded from the recovery hash.
+    """
+    digest = hashlib.sha256()
+    with sqlite3.connect(_sqlite_uri(database_path), uri=True, timeout=20) as conn:
+        for line in conn.iterdump():
+            if line.startswith('DELETE FROM "sqlite_sequence"') or line.startswith(
+                'INSERT INTO "sqlite_sequence"'
+            ):
+                continue
+            digest.update(line.encode("utf-8"))
+            digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def _manifest_path(data_dir: Path) -> Path:
@@ -132,19 +158,34 @@ def prepare_upgrade(
     if standard_exists and legacy_exists:
         data_dir = Path(prepare_data_dir(standard_dir, legacy_dir))
         manifest = _read_manifest(data_dir)
-        if manifest is None:
-            raise DatabaseMigrationError(
-                "新旧 Daily Care 数据库同时存在，但没有可验证的升级保护记录；"
-                "已停止以避免误判哪一份数据更新。"
-            )
         if not _is_valid_sqlite_database(legacy_path):
             raise DatabaseMigrationError(f"旧版数据库不可验证: {legacy_path}")
-        if manifest.get("source_fingerprint") != _database_fingerprint(legacy_path):
+        current_fingerprint = _database_fingerprint(legacy_path)
+        fingerprint_matches = False
+        if manifest is not None:
+            expected = manifest.get("source_fingerprint")
+            if isinstance(expected, dict):
+                fingerprint_matches = all(
+                    expected.get(key) == current_fingerprint.get(key)
+                    for key in ("database", "-wal")
+                )
+        if fingerprint_matches:
+            return data_dir
+        if _logical_database_fingerprint(standard_path) == _logical_database_fingerprint(
+            legacy_path
+        ):
+            _write_manifest(data_dir, current_fingerprint)
+            return data_dir
+        if manifest is None:
+            raise DatabaseMigrationError(
+                "新旧 Daily Care 数据库同时存在，但没有可验证的升级保护记录，且内容不一致；"
+                "已停止以避免误判哪一份数据更新。"
+            )
+        if not fingerprint_matches:
             raise DatabaseMigrationError(
                 "检测到旧版数据库在保护后发生变化，可能存在新增写入；"
                 "请停止升级并重新核对数据。"
             )
-        return data_dir
 
     if standard_exists:
         return Path(prepare_data_dir(standard_dir, legacy_dir))
