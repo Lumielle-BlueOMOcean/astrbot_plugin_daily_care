@@ -6,6 +6,8 @@
 [![AstrBot Plugin](https://img.shields.io/badge/AstrBot-Plugin-blue)](https://github.com/Soulter/AstrBot)
 [![CI](https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_daily_care/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_daily_care/actions/workflows/ci.yml)
 
+> 当前正式版本：**v1.1.13**
+
 ## 🌟 核心特性
 
 ### 🧠 和你说话的，是真正的 ta
@@ -15,6 +17,25 @@
 本插件采用了另一种做法：**插件本身只负责信息收集、感知与判断，最终开口和你说话的，是真正的 ta**。简单来说，本插件不是用插件模拟 ta 的陪伴，而是**让你的 ta 更好地陪伴你的工具**。
 
 技术上，插件只负责感知天气与状态、整理本轮相关的客观事实，并判断是否值得唤醒；随后通过 AstrBot 事件总线唤醒当前对话中的 Main Agent。最终用户看到的文字始终由 Main Agent 结合真实会话、人格、记忆和正常插件链路生成，Daily Care 不会另调 LLM 模拟人格，也不会绕过 Main Agent 直接发送。Main Agent 可以选择开口，也可以选择不打扰；内部判断、框架错误和未完成的唤醒不会展示给用户。只有通过校验的最终正文才会发送，且平台确认发送成功后才写入真实对话历史。
+
+## 更新日志
+
+### v1.1.13
+
+相对于 v1.1.12，本版本聚焦主动唤醒生命周期和会话恢复。
+
+**修复**
+
+- 修复主动关怀消息发送后的收尾路径重复获取同一会话锁，导致后续普通聊天可能长时间等待的问题。
+- 修复旧唤醒尚未完成时内部 claim 超时释放后仍反复入队的问题；过期唤醒会保持失效，不会在恢复后意外发送。
+- 修复平台发送失败、框架异常和主动沉默路径的终态清理，避免唤醒或计划状态悬挂、重复发送或错误写入历史。
+
+**改进**
+
+- 收紧平台实际发送确认、真实历史写回和发送状态更新的顺序，并增加重复处理保护。
+- 增加 AstrBot 4.28.0 运行时兼容性 smoke 和主动唤醒生命周期回归测试，同时保留 AstrBot 4.25.5 smoke。
+
+[查看完整历史更新记录](CHANGELOG.md)
 
 ### 🌦 天气感知
 
@@ -70,7 +91,7 @@
 2. 在 AstrBot 管理面板「插件管理」中选择手动安装，上传 zip 或填入 GitHub 仓库地址
 3. 启用插件，重载或重启使配置生效
 
-**前置条件**：AstrBot ≥ 4.24.0；已配置可用的 LLM Provider（状态反思与天气判断依赖 LLM）。GitHub CI 的真实运行时兼容性检查基于 AstrBot 4.25.5。
+**前置条件**：AstrBot ≥ 4.24.0；已配置可用的 LLM Provider（状态反思与天气判断依赖 LLM）。GitHub CI 对 AstrBot 4.25.5 与 4.28.0 执行运行时兼容性 smoke；这不等于所有 AstrBot 版本均已完成完整端到端验证。
 
 ### 初始化
 
