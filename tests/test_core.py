@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -178,6 +179,55 @@ def test_standard_data_directory_and_legacy_migration():
     with open(broken_path, "rb") as handle:
         assert handle.read() == b"not a sqlite database"
     print("✓ 标准数据目录、WAL 迁移、幂等与失败保护测试通过")
+
+
+def test_standard_sqlite_requires_daily_care_schema():
+    """无 Daily Care 表的 SQLite 文件不能静默阻止旧库迁移。"""
+    from core.database import DatabaseMigrationError, prepare_data_dir
+
+    root = tempfile.mkdtemp(prefix="daily_care_storage_schema_test_")
+    legacy_dir = os.path.join(root, "data", "plugins", "astrbot_plugin_daily_care", "data")
+    standard_dir = os.path.join(root, "data", "plugin_data", "astrbot_plugin_daily_care")
+    legacy = CareDatabase(legacy_dir)
+    legacy.kv_set("migration_marker", {"source": "legacy"})
+
+    os.makedirs(standard_dir, exist_ok=True)
+    empty_sqlite_path = os.path.join(standard_dir, "daily_care.db")
+    with sqlite3.connect(empty_sqlite_path) as conn:
+        conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+
+    try:
+        prepare_data_dir(standard_dir, legacy_dir)
+    except DatabaseMigrationError:
+        pass
+    else:
+        raise AssertionError("无 Daily Care 表的 SQLite 文件被错误视为有效新库")
+
+    assert CareDatabase(legacy_dir).kv_get("migration_marker") == {"source": "legacy"}
+    assert os.path.exists(empty_sqlite_path)
+    print("✓ 无业务表 SQLite 冲突保护测试通过")
+
+
+def test_upgrade_preflight_survives_plugin_directory_replacement():
+    """升级前保护后的数据库不依赖旧插件目录继续存在。"""
+    from core.database import prepare_data_dir
+    from scripts.prepare_upgrade import prepare_upgrade
+
+    root = tempfile.mkdtemp(prefix="daily_care_upgrade_preflight_test_")
+    plugin_dir = os.path.join(root, "data", "plugins", "astrbot_plugin_daily_care")
+    legacy_dir = os.path.join(plugin_dir, "data")
+    legacy = CareDatabase(legacy_dir)
+    target_id = legacy.add_target("升级对象", user_id="42", is_default=1)
+    legacy.kv_set("preflight_marker", {"target_id": target_id})
+
+    standard_dir = prepare_upgrade(root)
+    shutil.rmtree(plugin_dir)
+
+    prepare_data_dir(standard_dir, legacy_dir)
+    migrated = CareDatabase(standard_dir)
+    assert migrated.get_target(target_id)["name"] == "升级对象"
+    assert migrated.kv_get("preflight_marker") == {"target_id": target_id}
+    print("✓ 真实更新器删除旧插件目录后的数据保留测试通过")
 
 
 def test_geoip_never_uses_sync_fallback():
@@ -2595,6 +2645,8 @@ if __name__ == "__main__":
     test_wake_protocol()
     test_database()
     test_standard_data_directory_and_legacy_migration()
+    test_standard_sqlite_requires_daily_care_schema()
+    test_upgrade_preflight_survives_plugin_directory_replacement()
     test_geoip_never_uses_sync_fallback()
     test_plan_and_send_lifecycle()
     test_wake_event_contract()

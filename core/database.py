@@ -16,6 +16,23 @@ class DatabaseMigrationError(RuntimeError):
     """Raised when the legacy database cannot be migrated safely."""
 
 
+REQUIRED_DAILY_CARE_TABLES = frozenset(
+    {
+        "locations",
+        "care_targets",
+        "profile",
+        "care_events",
+        "care_causes",
+        "care_plans",
+        "send_log",
+        "weather_cache",
+        "decision_log",
+        "kv",
+        "event_stream",
+    }
+)
+
+
 def _sqlite_uri(path: Path, mode: str = "ro") -> str:
     return f"{path.resolve().as_uri()}?mode={mode}"
 
@@ -32,13 +49,22 @@ def _has_sqlite_sidecar(path: Path) -> bool:
 
 
 def _is_valid_sqlite_database(path: Path) -> bool:
-    """Check an existing SQLite file without creating or modifying it."""
+    """Check SQLite integrity and the application schema without modifying it."""
     if not path.is_file() or path.stat().st_size == 0:
         return False
     try:
         with sqlite3.connect(_sqlite_uri(path), uri=True, timeout=20) as conn:
             result = conn.execute("PRAGMA integrity_check").fetchone()
-            return bool(result and str(result[0]).lower() == "ok")
+            if not result or str(result[0]).lower() != "ok":
+                return False
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            return REQUIRED_DAILY_CARE_TABLES.issubset(tables)
     except (OSError, sqlite3.Error):
         return False
 

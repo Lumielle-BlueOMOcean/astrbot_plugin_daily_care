@@ -13,10 +13,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import tomllib
+import zipfile
 from pathlib import Path
 
 
@@ -26,7 +28,8 @@ if not ASTRBOT_SOURCE.is_dir():
     raise SystemExit("ASTRBOT_SOURCE must point to a checked-out AstrBot source tree")
 
 sys.path.insert(0, str(ASTRBOT_SOURCE))
-sys.path.insert(1, str(REPO_ROOT.parent))
+sys.path.insert(1, str(REPO_ROOT))
+sys.path.insert(2, str(REPO_ROOT.parent))
 
 from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.message.components import At, Plain
@@ -255,6 +258,61 @@ async def _run_silent_cleanup_smoke(event_cls) -> None:
     print("PASS: silent cleanup and normal user lock recovery")
 
 
+async def _run_real_updater_data_smoke() -> None:
+    """Run the real 4.28 updater after an upgrade-preflight protection step."""
+    from astrbot.core.star.star import StarMetadata
+    from astrbot.core.star.updater import _PluginUpdater
+
+    from scripts.prepare_upgrade import prepare_upgrade
+    from astrbot_plugin_daily_care.core.database import CareDatabase
+
+    original_root = os.environ.get("ASTRBOT_ROOT")
+    with tempfile.TemporaryDirectory(prefix="daily_care_updater_smoke_") as root:
+        os.environ["ASTRBOT_ROOT"] = root
+        try:
+            plugin_dir = Path(root) / "data" / "plugins" / "astrbot_plugin_daily_care"
+            legacy_db = CareDatabase(plugin_dir / "data")
+            target_id = legacy_db.add_target("updater-smoke", user_id="42", is_default=1)
+            legacy_db.kv_set("updater_marker", {"target_id": target_id})
+
+            protected_dir = prepare_upgrade(root)
+            archive_path = Path(root) / "replacement.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(
+                    "astrbot_plugin_daily_care/metadata.yaml",
+                    "name: astrbot_plugin_daily_care\n"
+                    "author: smoke\n"
+                    "desc: updater smoke\n"
+                    "version: 1.1.13\n",
+                )
+
+            updater = _PluginUpdater()
+
+            async def fake_download(_url: str, target_path: str) -> None:
+                shutil.copyfile(archive_path, target_path)
+
+            updater._download_file = fake_download
+            plugin = StarMetadata(
+                name="astrbot_plugin_daily_care",
+                author="smoke",
+                desc="updater smoke",
+                version="1.1.13",
+                root_dir_name="astrbot_plugin_daily_care",
+            )
+            await updater.update(plugin, download_url="fixture")
+
+            _assert(not (plugin_dir / "data" / "daily_care.db").exists(), "updater left legacy DB in plugin directory")
+            restored = CareDatabase(protected_dir)
+            _assert(restored.get_target(target_id)["name"] == "updater-smoke", "updater lost target")
+            _assert(restored.kv_get("updater_marker") == {"target_id": target_id}, "updater lost KV data")
+        finally:
+            if original_root is None:
+                os.environ.pop("ASTRBOT_ROOT", None)
+            else:
+                os.environ["ASTRBOT_ROOT"] = original_root
+    print("PASS: real AstrBot 4.28 updater preserves preflighted data")
+
+
 async def _run_smoke() -> None:
     event_cls = _build_daily_care_wake_event(CronMessageEvent)
     _assert(issubclass(event_cls, CronMessageEvent), "wake event MRO is incompatible")
@@ -277,6 +335,7 @@ async def _run_smoke() -> None:
     await _run_transport_smoke(event_cls)
     await _run_silent_cleanup_smoke(event_cls)
     await _run_expiry_and_lock_smoke(event_cls)
+    await _run_real_updater_data_smoke()
 
 
 def main() -> None:
