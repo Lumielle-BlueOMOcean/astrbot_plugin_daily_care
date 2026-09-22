@@ -275,7 +275,7 @@ async def _run_real_updater_data_smoke() -> None:
             target_id = legacy_db.add_target("updater-smoke", user_id="42", is_default=1)
             legacy_db.kv_set("updater_marker", {"target_id": target_id})
 
-            protected_dir = prepare_upgrade(root)
+            protected_dir = prepare_upgrade(root, core_stopped=True)
             archive_path = Path(root) / "replacement.zip"
             with zipfile.ZipFile(archive_path, "w") as archive:
                 archive.writestr(

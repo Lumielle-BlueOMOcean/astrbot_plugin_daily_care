@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -210,7 +211,6 @@ def test_standard_sqlite_requires_daily_care_schema():
 
 def test_upgrade_preflight_survives_plugin_directory_replacement():
     """升级前保护后的数据库不依赖旧插件目录继续存在。"""
-    from core.database import prepare_data_dir
     from scripts.prepare_upgrade import prepare_upgrade
 
     root = tempfile.mkdtemp(prefix="daily_care_upgrade_preflight_test_")
@@ -220,14 +220,93 @@ def test_upgrade_preflight_survives_plugin_directory_replacement():
     target_id = legacy.add_target("升级对象", user_id="42", is_default=1)
     legacy.kv_set("preflight_marker", {"target_id": target_id})
 
-    standard_dir = prepare_upgrade(root)
+    standard_dir = prepare_upgrade(root, core_stopped=True)
     shutil.rmtree(plugin_dir)
 
-    prepare_data_dir(standard_dir, legacy_dir)
+    assert prepare_upgrade(root) == standard_dir
     migrated = CareDatabase(standard_dir)
     assert migrated.get_target(target_id)["name"] == "升级对象"
     assert migrated.kv_get("preflight_marker") == {"target_id": target_id}
+    migrated.kv_set("preflight_marker", {"target_id": target_id, "version": "new"})
+    assert prepare_upgrade(root) == standard_dir
+    assert CareDatabase(standard_dir).kv_get("preflight_marker") == {
+        "target_id": target_id,
+        "version": "new",
+    }
     print("✓ 真实更新器删除旧插件目录后的数据保留测试通过")
+
+
+def test_upgrade_preflight_requires_database_and_reports_error():
+    """错误 AstrBot 根目录不得创建空库或报告升级准备成功。"""
+    script = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "scripts",
+        "prepare_upgrade.py",
+    )
+    root = tempfile.mkdtemp(prefix="daily_care_upgrade_missing_root_")
+    result = subprocess.run(
+        [sys.executable, script, "--astrbot-root", root],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "未找到" in output
+    assert "核实" in output
+    assert not os.path.exists(os.path.join(root, "data"))
+    print("✓ 错误根目录拒绝无数据库升级测试通过")
+
+
+def test_upgrade_preflight_requires_stopped_core_for_legacy_database():
+    """旧库迁移必须显式确认 Core 已停止，避免备份后继续写入。"""
+    from core.database import DatabaseMigrationError
+    from scripts.prepare_upgrade import prepare_upgrade
+
+    root = tempfile.mkdtemp(prefix="daily_care_upgrade_online_guard_")
+    legacy_dir = os.path.join(root, "data", "plugins", "astrbot_plugin_daily_care", "data")
+    legacy = CareDatabase(legacy_dir)
+    legacy.kv_set("online_guard", {"source": "legacy"})
+
+    try:
+        prepare_upgrade(root)
+    except DatabaseMigrationError as exc:
+        assert "停止" in str(exc)
+    else:
+        raise AssertionError("旧库在线迁移未被拒绝")
+    assert not os.path.exists(
+        os.path.join(root, "data", "plugin_data", "astrbot_plugin_daily_care", "daily_care.db")
+    )
+    print("✓ 旧库在线迁移拒绝测试通过")
+
+
+def test_upgrade_preflight_detects_legacy_writes_after_snapshot():
+    """保护后旧库若继续写入，下一步必须阻止而不是静默丢数据。"""
+    from core.database import DatabaseMigrationError
+    from scripts.prepare_upgrade import prepare_upgrade
+
+    root = tempfile.mkdtemp(prefix="daily_care_upgrade_drift_test_")
+    legacy_dir = os.path.join(root, "data", "plugins", "astrbot_plugin_daily_care", "data")
+    legacy = CareDatabase(legacy_dir)
+    legacy.kv_set("before_snapshot", {"value": 1})
+
+    prepare_upgrade(root, core_stopped=True)
+    legacy.kv_set("after_snapshot", {"value": 2})
+
+    try:
+        prepare_upgrade(root, core_stopped=True)
+    except DatabaseMigrationError as exc:
+        assert "变化" in str(exc) or "写入" in str(exc)
+    else:
+        raise AssertionError("旧库快照后的新增写入未被检测")
+
+    standard_path = os.path.join(
+        root, "data", "plugin_data", "astrbot_plugin_daily_care", "daily_care.db"
+    )
+    protected = CareDatabase(os.path.dirname(standard_path))
+    assert protected.kv_get("before_snapshot") == {"value": 1}
+    assert protected.kv_get("after_snapshot") is None
+    print("✓ 旧库快照后写入阻断测试通过")
 
 
 def test_geoip_never_uses_sync_fallback():
@@ -2647,6 +2726,9 @@ if __name__ == "__main__":
     test_standard_data_directory_and_legacy_migration()
     test_standard_sqlite_requires_daily_care_schema()
     test_upgrade_preflight_survives_plugin_directory_replacement()
+    test_upgrade_preflight_requires_database_and_reports_error()
+    test_upgrade_preflight_requires_stopped_core_for_legacy_database()
+    test_upgrade_preflight_detects_legacy_writes_after_snapshot()
     test_geoip_never_uses_sync_fallback()
     test_plan_and_send_lifecycle()
     test_wake_event_contract()
