@@ -6,8 +6,106 @@
 import json
 import os
 import sqlite3
+import tempfile
 import time
+from pathlib import Path
 from typing import Any, Optional
+
+
+class DatabaseMigrationError(RuntimeError):
+    """Raised when the legacy database cannot be migrated safely."""
+
+
+def _sqlite_uri(path: Path, mode: str = "ro") -> str:
+    return f"{path.resolve().as_uri()}?mode={mode}"
+
+
+def _has_sqlite_sidecar(path: Path) -> bool:
+    return any(
+        sidecar.exists()
+        for sidecar in (
+            Path(f"{path}-wal"),
+            Path(f"{path}-shm"),
+            Path(f"{path}-journal"),
+        )
+    )
+
+
+def _is_valid_sqlite_database(path: Path) -> bool:
+    """Check an existing SQLite file without creating or modifying it."""
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    try:
+        with sqlite3.connect(_sqlite_uri(path), uri=True, timeout=20) as conn:
+            result = conn.execute("PRAGMA integrity_check").fetchone()
+            return bool(result and str(result[0]).lower() == "ok")
+    except (OSError, sqlite3.Error):
+        return False
+
+
+def _migrate_sqlite_database(source_path: Path, target_path: Path) -> None:
+    """Copy a legacy database through SQLite's consistent backup API."""
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{target_path.name}.",
+        suffix=".migrating",
+        dir=target_path.parent,
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        with sqlite3.connect(_sqlite_uri(source_path), uri=True, timeout=20) as source:
+            with sqlite3.connect(str(temporary_path), timeout=20) as target:
+                source.backup(target)
+                target.commit()
+        if not _is_valid_sqlite_database(temporary_path):
+            raise DatabaseMigrationError("迁移后的 SQLite 数据库完整性检查失败")
+        os.replace(temporary_path, target_path)
+    except DatabaseMigrationError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise DatabaseMigrationError(f"SQLite 数据库迁移失败: {exc}") from exc
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def prepare_data_dir(data_dir: str | os.PathLike, legacy_data_dir: str | os.PathLike) -> str:
+    """Prepare the standard plugin data directory before opening ``CareDatabase``.
+
+    A valid new database always wins.  A legacy database is copied only when
+    the new database does not exist, using SQLite's backup API so committed
+    WAL transactions are included.  Any ambiguity or failed validation stops
+    startup rather than creating an empty database over user data.
+    """
+    target_dir = Path(data_dir)
+    target_path = target_dir / "daily_care.db"
+    legacy_dir = Path(legacy_data_dir)
+    legacy_path = legacy_dir / "daily_care.db"
+
+    target_exists = target_path.exists() or _has_sqlite_sidecar(target_path)
+    legacy_exists = legacy_path.exists() or _has_sqlite_sidecar(legacy_path)
+
+    if target_exists:
+        if not _is_valid_sqlite_database(target_path):
+            raise DatabaseMigrationError(
+                f"标准数据目录中的数据库不可用，已停止初始化: {target_path}"
+            )
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return str(target_dir)
+
+    if legacy_exists:
+        if not _is_valid_sqlite_database(legacy_path):
+            raise DatabaseMigrationError(
+                f"旧版数据库不可用，已停止迁移且未创建新数据库: {legacy_path}"
+            )
+        target_dir.mkdir(parents=True, exist_ok=True)
+        _migrate_sqlite_database(legacy_path, target_path)
+        return str(target_dir)
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return str(target_dir)
 
 
 class CareDatabase:

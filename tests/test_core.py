@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -99,6 +100,135 @@ def test_database():
     db.add_send_log(t_id, 0, "hi", "test")
     assert db.count_send_today(t_id, datetime.now().strftime("%Y-%m-%d")) == 1
     print("✓ 数据库测试通过")
+
+
+def test_standard_data_directory_and_legacy_migration():
+    """插件数据应迁移到标准目录，并保留 SQLite/WAL 中的已提交数据。"""
+    from core.database import DatabaseMigrationError, prepare_data_dir
+
+    root = tempfile.mkdtemp(prefix="daily_care_storage_test_")
+    plugin_dir = os.path.join(root, "data", "plugins", "astrbot_plugin_daily_care")
+    legacy_dir = os.path.join(plugin_dir, "data")
+    standard_dir = os.path.join(root, "data", "plugin_data", "astrbot_plugin_daily_care")
+
+    legacy_db = CareDatabase(legacy_dir)
+    legacy_db.kv_set("migration_marker", {"source": "legacy"})
+    target_id = legacy_db.add_target("迁移对象", "用户", is_default=1)
+    event_id = legacy_db.add_event(
+        target_id, "state", "需要休息", "迁移测试事件", ttl_hours=24
+    )
+    plan_id = legacy_db.add_plan(
+        event_id, target_id, "2099-01-01", "evening", "care", "迁移测试计划"
+    )
+    legacy_db.add_send_log(target_id, plan_id, "迁移测试消息", "care")
+    legacy_path = os.path.join(legacy_dir, "daily_care.db")
+    wal_conn = sqlite3.connect(legacy_path)
+    wal_conn.execute("PRAGMA journal_mode=WAL")
+    wal_conn.execute(
+        "INSERT INTO kv(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ("wal_marker", json.dumps({"source": "wal"}, ensure_ascii=False),),
+    )
+    wal_conn.commit()
+    assert os.path.exists(legacy_path + "-wal")
+
+    prepare_data_dir(standard_dir, legacy_dir)
+    migrated = CareDatabase(standard_dir)
+    assert migrated.kv_get("migration_marker") == {"source": "legacy"}
+    assert migrated.kv_get("wal_marker") == {"source": "wal"}
+    assert migrated.get_target(target_id)["name"] == "迁移对象"
+    assert migrated.get_active_events(target_id)[0]["summary"] == "需要休息"
+    assert migrated.get_pending_plans("2099-01-01")[0]["id"] == plan_id
+    assert migrated.count_send_today(target_id, "2099-01-01", "care") == 0
+    with migrated._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM send_log WHERE plan_id=?", (plan_id,)).fetchone()[0] == 1
+    assert os.path.exists(legacy_path)
+    assert not os.path.exists(os.path.join(plugin_dir, "daily_care.db"))
+
+    # Re-running must prefer the valid new database and never re-import old data.
+    migrated.kv_set("migration_marker", {"source": "new"})
+    prepare_data_dir(standard_dir, legacy_dir)
+    assert CareDatabase(standard_dir).kv_get("migration_marker") == {"source": "new"}
+    wal_conn.close()
+
+    coexist_root = tempfile.mkdtemp(prefix="daily_care_storage_coexist_")
+    coexist_legacy = os.path.join(coexist_root, "plugin", "data")
+    coexist_standard = os.path.join(
+        coexist_root, "data", "plugin_data", "astrbot_plugin_daily_care"
+    )
+    CareDatabase(coexist_legacy).kv_set("winner", "legacy")
+    CareDatabase(coexist_standard).kv_set("winner", "new")
+    prepare_data_dir(coexist_standard, coexist_legacy)
+    assert CareDatabase(coexist_standard).kv_get("winner") == "new"
+
+    broken_root = tempfile.mkdtemp(prefix="daily_care_storage_failure_")
+    broken_legacy = os.path.join(broken_root, "plugin", "data")
+    os.makedirs(broken_legacy, exist_ok=True)
+    broken_path = os.path.join(broken_legacy, "daily_care.db")
+    with open(broken_path, "wb") as handle:
+        handle.write(b"not a sqlite database")
+    broken_standard = os.path.join(broken_root, "plugin_data", "astrbot_plugin_daily_care")
+    try:
+        prepare_data_dir(broken_standard, broken_legacy)
+    except DatabaseMigrationError:
+        pass
+    else:
+        raise AssertionError("损坏旧库未阻止初始化")
+    assert not os.path.exists(os.path.join(broken_standard, "daily_care.db"))
+    with open(broken_path, "rb") as handle:
+        assert handle.read() == b"not a sqlite database"
+    print("✓ 标准数据目录、WAL 迁移、幂等与失败保护测试通过")
+
+
+def test_geoip_never_uses_sync_fallback():
+    """aiohttp 不可用时定位应安全失败，不得阻塞事件循环。"""
+    from core import geoip
+
+    original_aiohttp = geoip.aiohttp
+    import urllib.request
+
+    original_urlopen = urllib.request.urlopen
+
+    def forbidden_urlopen(*args, **kwargs):
+        raise AssertionError("geoip 不得调用同步 urllib 请求")
+
+    geoip.aiohttp = None
+    urllib.request.urlopen = forbidden_urlopen
+    try:
+        assert asyncio.run(geoip.locate_by_ip()) is None
+    finally:
+        urllib.request.urlopen = original_urlopen
+        geoip.aiohttp = original_aiohttp
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def read(self):
+            return json.dumps({"city": "西安", "pro": "陕西省"}).encode("gbk")
+
+    class FakeSession:
+        def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    class FakeAiohttp:
+        class ClientTimeout:
+            def __init__(self, total):
+                self.total = total
+
+    geoip.aiohttp = FakeAiohttp
+    try:
+        located = asyncio.run(geoip.locate_by_ip(FakeSession()))
+    finally:
+        geoip.aiohttp = original_aiohttp
+    assert located["city"] == "西安"
+    assert located["region"] == "陕西省"
+    print("✓ IP 定位异步路径与缺失依赖安全失败测试通过")
 
 
 def test_plan_and_send_lifecycle():
@@ -2464,6 +2594,8 @@ def test_mutex_between_proactive_and_care():
 if __name__ == "__main__":
     test_wake_protocol()
     test_database()
+    test_standard_data_directory_and_legacy_migration()
+    test_geoip_never_uses_sync_fallback()
     test_plan_and_send_lifecycle()
     test_wake_event_contract()
     test_wake_barrier_releases_only_after_core_cleanup()

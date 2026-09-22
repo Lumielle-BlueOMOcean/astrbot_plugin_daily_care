@@ -4,7 +4,6 @@
 优先 pconline（国内权威库，对中国移动等运营商 IP 段归属准确，免费无 key，GBK 编码），
 失败降级 ip-api.com（免费无 key）。
 """
-import asyncio
 import json
 from typing import Optional
 
@@ -30,8 +29,8 @@ def _clean_city(city: str) -> str:
 async def locate_by_ip(session=None) -> Optional[dict]:
     """返回 {city, lat, lon, region}；失败返回 None"""
     if aiohttp is None:
-        # 尝试用标准库 urllib 同步定位（极简降级）
-        return _locate_urllib()
+        logger.warning("[DailyCare] IP定位不可用：缺少 aiohttp 异步网络库")
+        return None
     if session is None:
         session = aiohttp.ClientSession()
         close = True
@@ -81,39 +80,6 @@ async def locate_by_ip(session=None) -> Optional[dict]:
     finally:
         if close:
             await session.close()
-
-
-def _locate_urllib() -> Optional[dict]:
-    """标准库降级定位（无 aiohttp 时）"""
-    try:
-        import urllib.request
-
-        req = urllib.request.Request(
-            "https://whois.pconline.com.cn/ipJson.jsp?json=true",
-            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            raw = resp.read()
-        data = json.loads(raw.decode("gbk", errors="ignore"))
-        city = _clean_city(data.get("city") or "")
-        region = data.get("pro") or data.get("addr") or ""
-        if city:
-            gc = geocode_city_sync(city)
-            if gc:
-                return {"city": city, "lat": float(gc["lat"]), "lon": float(gc["lon"]), "region": region}
-    except Exception as e:
-        logger.debug(f"[DailyCare] urllib 定位失败: {e}")
-    return None
-
-
-def geocode_city_sync(city: str) -> Optional[dict]:
-    """同步版城市坐标（仅内置表，供 urllib 降级用）"""
-    city = (city or "").strip()
-    if city in COORD_FIX:
-        lat, lon = COORD_FIX[city]
-        return {"city": city, "lat": lat, "lon": lon, "region": ""}
-    return None
-
 
 def _city_candidates(city: str) -> list:
     """生成城市名候选（支持『省 市 区县』多级路径，从精确到模糊逐级回退）。

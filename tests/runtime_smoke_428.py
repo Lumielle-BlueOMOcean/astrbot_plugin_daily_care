@@ -15,6 +15,7 @@ import inspect
 import os
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -58,6 +59,24 @@ def _assert_runtime_version() -> None:
     ).strip()
     _assert(tag == "v4.28.0", f"AstrBot checkout is {tag!r}, not v4.28.0")
     print("PASS: AstrBot version 4.28.0")
+
+
+def _assert_standard_plugin_data_path() -> None:
+    original_root = os.environ.get("ASTRBOT_ROOT")
+    with tempfile.TemporaryDirectory(prefix="daily_care_runtime_data_") as root:
+        os.environ["ASTRBOT_ROOT"] = root
+        try:
+            from astrbot_plugin_daily_care import main as plugin_main
+
+            data_dir = Path(plugin_main._resolve_data_dir()).resolve()
+        finally:
+            if original_root is None:
+                os.environ.pop("ASTRBOT_ROOT", None)
+            else:
+                os.environ["ASTRBOT_ROOT"] = original_root
+        expected = (Path(root) / "data" / "plugin_data" / "astrbot_plugin_daily_care").resolve()
+        _assert(data_dir == expected, f"unexpected plugin data path: {data_dir}")
+    print("PASS: standard AstrBot plugin data path")
 
 
 class CountingContext:
@@ -262,6 +281,7 @@ async def _run_smoke() -> None:
 
 def main() -> None:
     _assert_runtime_version()
+    _assert_standard_plugin_data_path()
     asyncio.run(_run_smoke())
 
 

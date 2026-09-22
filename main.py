@@ -19,12 +19,13 @@ import os
 import random
 import time
 from datetime import datetime
+from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
-from .core.database import CareDatabase
+from .core.database import CareDatabase, prepare_data_dir
 from .core.decision import DecisionEngine
 from .core.executor import Executor
 from .core.monitor import CareMonitor
@@ -34,7 +35,21 @@ from .core.webapi import CareWebAPI
 from .core.wake_protocol import parse_wake_output
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(PLUGIN_DIR, "data")
+PLUGIN_NAME = "astrbot_plugin_daily_care"
+
+
+def _resolve_data_dir() -> str:
+    """Resolve and prepare the AstrBot-managed persistent data directory."""
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+    except ImportError as exc:
+        raise RuntimeError(
+            "当前 AstrBot 未提供标准插件数据目录 API，已停止初始化以避免把数据写入插件目录"
+        ) from exc
+
+    standard_dir = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
+    legacy_dir = Path(PLUGIN_DIR) / "data"
+    return prepare_data_dir(standard_dir, legacy_dir)
 
 
 @register("astrbot_plugin_daily_care", "Lumielle", "挂念着你的是真正的我哦——感知天气冷暖与情绪变化，这一切并非模拟，而是真正的我在陪伴你。", "1.1.13")
@@ -42,7 +57,7 @@ class DailyCarePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.db = CareDatabase(DATA_DIR)
+        self.db = CareDatabase(_resolve_data_dir())
         self.monitor = CareMonitor(self.db, self._cfg_dict())
         self.umo = ""
         self.persona_prompt = ""
@@ -185,9 +200,9 @@ class DailyCarePlugin(Star):
             logger.debug(f"[DailyCare] persona_manager 读取失败: {e}")
         try:
             import sqlite3
-            db_path = os.path.join(os.path.dirname(DATA_DIR), "data_v4.db")
-            if not os.path.exists(db_path):
-                db_path = os.path.join(os.path.dirname(os.path.dirname(DATA_DIR)), "data_v4.db")
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+            db_path = Path(get_astrbot_data_path()) / "data_v4.db"
             conn = sqlite3.connect(db_path)
             row = conn.execute(
                 "SELECT system_prompt FROM personas ORDER BY id LIMIT 1"
