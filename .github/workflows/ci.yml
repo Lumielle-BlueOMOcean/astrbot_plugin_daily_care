@@ -156,7 +156,7 @@ jobs:
       - name: Install runtime smoke dependencies
         run: python -m pip install --disable-pip-version-check -r ci/runtime-smoke-requirements.txt
 
-      - name: Run AstrBot 4.26.6 hook and transport smoke
+      - name: Run AstrBot 4.26.6 scheduler, hook, and transport smoke
         env:
           ASTRBOT_SOURCE: .ci/AstrBot
         run: python tests/runtime_smoke_4266.py

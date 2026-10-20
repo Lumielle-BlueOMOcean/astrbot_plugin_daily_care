@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AstrBot 4.26.6 hook dispatch smoke for Daily Care wake authorization.
+"""AstrBot 4.26.6 scheduler and hook smoke for Daily Care wake authorization.
 
 Uses the actual AstrBot source tree selected by ``ASTRBOT_SOURCE`` and its
 registry, MainAgentHooks, CronMessageEvent, MessageChain, and Plain classes.
@@ -12,9 +12,12 @@ import asyncio
 import functools
 import importlib
 import inspect
+import json
 import os
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import types
 import tomllib
 from pathlib import Path
@@ -51,6 +54,7 @@ from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.message.components import At, Plain
 from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
 from astrbot.core.pipeline.context_utils import call_event_hook
+from astrbot.core.pipeline.scheduler import PipelineScheduler
 from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
 from astrbot.core.pipeline.respond.stage import RespondStage
 from astrbot.core.platform.message_session import MessageSession
@@ -65,6 +69,7 @@ from data.plugins.astrbot_plugin_daily_care.core.wake import (
     WakeChannel,
     _build_daily_care_wake_event,
 )
+from data.plugins.astrbot_plugin_daily_care.core.database import CareDatabase
 
 
 PLUGIN_MODULE_PATH = "data.plugins.astrbot_plugin_daily_care.main"
@@ -120,6 +125,107 @@ def _new_event(event_cls, context, wake_id: str):
     )
 
 
+class _AgentCompletionStage:
+    """Provider-free agent boundary using real MainAgentHooks dispatch."""
+
+    def __init__(self, raw: str, trace: list[str]):
+        self.raw = raw
+        self.trace = trace
+
+    async def process(self, event):
+        self.trace.append("agent")
+        request = SimpleNamespace(func_tool=object(), prompt="")
+        await call_event_hook(event, EventType.OnLLMRequestEvent, request)
+        response = LLMResponse(role="assistant", completion_text=self.raw)
+        run_context = SimpleNamespace(
+            context=SimpleNamespace(event=event),
+            messages=[
+                SimpleNamespace(role="user", content=[]),
+                SimpleNamespace(role="assistant", content=[]),
+            ],
+        )
+        await MAIN_AGENT_HOOKS.on_agent_done(run_context, response)
+        event.set_result(MessageEventResult().message(response.completion_text))
+        self.trace.append("agent_result")
+        yield
+
+
+def _observed_stage(stage, stage_name: str, trace: list[str], observe=None):
+    """Observe entry while delegating execution to the real AstrBot stage."""
+    original_process = stage.process
+
+    if inspect.isasyncgenfunction(original_process):
+        async def process(event):
+            trace.append(stage_name)
+            if observe is not None:
+                observe(event)
+            async for item in original_process(event):
+                yield item
+    else:
+        async def process(event):
+            trace.append(stage_name)
+            if observe is not None:
+                observe(event)
+            await original_process(event)
+
+    stage.process = process
+    return stage
+
+
+def _actual_scheduler(trace: list[str], raw: str, respond_payloads=None):
+    """Use the real scheduler algorithm and real downstream AstrBot stages."""
+
+    def observe_respond(event):
+        result = event.get_result()
+        respond_payloads.append(
+            result.get_plain_text() if result is not None else None
+        )
+
+    scheduler = PipelineScheduler.__new__(PipelineScheduler)
+    scheduler.stages = [
+        _AgentCompletionStage(raw, trace),
+        _observed_stage(_decorator_stage(), "decorating", trace),
+        _observed_stage(
+            _respond_stage(),
+            "respond",
+            trace,
+            observe=observe_respond if respond_payloads is not None else None,
+        ),
+    ]
+    return scheduler
+
+
+class _SqliteConversationManager:
+    """Minimal isolated persistence adapter for Daily Care's conversation API."""
+
+    def __init__(self, db_path: Path, umo: str, conversation_id: str):
+        self.db_path = db_path
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "CREATE TABLE conversation (umo TEXT, cid TEXT, history TEXT, "
+                "PRIMARY KEY (umo, cid))"
+            )
+            conn.execute(
+                "INSERT INTO conversation VALUES (?, ?, '[]')",
+                (umo, conversation_id),
+            )
+
+    async def get_conversation(self, umo: str, conversation_id: str):
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT history FROM conversation WHERE umo=? AND cid=?",
+                (umo, conversation_id),
+            ).fetchone()
+        return SimpleNamespace(history=row[0]) if row else None
+
+    async def update_conversation(self, umo: str, conversation_id: str, *, history):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE conversation SET history=? WHERE umo=? AND cid=?",
+                (json.dumps(history, ensure_ascii=False), umo, conversation_id),
+            )
+
+
 class _Context:
     def __init__(self, result=True):
         self.result = result
@@ -130,6 +236,260 @@ class _Context:
         if isinstance(self.result, BaseException):
             raise self.result
         return self.result
+
+
+async def _test_real_scheduler_stage_propagation_and_database(plugin) -> None:
+    """Exercise Scheduler.execute, hook dispatch, RespondStage, and persistence."""
+    expected = "午饭吃了吗？"
+    event_class = _build_daily_care_wake_event(CronMessageEvent)
+
+    with tempfile.TemporaryDirectory(prefix="dailycare-4266-scheduler-") as tmp:
+        temp_root = Path(tmp)
+        care_db = CareDatabase(str(temp_root / "care-data"))
+        conversation_id = "isolated-conversation"
+        history_db_path = temp_root / "conversation-history.sqlite3"
+
+        def make_context():
+            context = _Context()
+            context.conversation_manager = _SqliteConversationManager(
+                history_db_path,
+                "aiocqhttp:FriendMessage:42",
+                conversation_id,
+            )
+            return context
+
+        plugin.db = care_db
+        plugin.context = SimpleNamespace()
+        plugin._executor = SimpleNamespace(
+            _last_send_key=lambda target_id, channel: f"last:{target_id}:{channel}"
+        )
+
+        def make_event(context, wake_id):
+            event = _new_event(event_class, context, wake_id)
+            care = event.get_extra("daily_care")
+            care.update(
+                {
+                    "target_id": 71,
+                    "channel": "care",
+                    "plan_id": 0,
+                    "conversation_id": conversation_id,
+                    "umo": event.unified_msg_origin,
+                }
+            )
+            return event
+
+        # No other hook stops propagation: the actual scheduler must send and
+        # the real after-send handler must persist both delivery and history.
+        context = make_context()
+        event = make_event(context, "scheduler-send")
+        _assert(event.plugins_name is None, "wildcard plugin scope should leave plugins_name unrestricted")
+        trace: list[str] = []
+        scheduler = _actual_scheduler(
+            trace,
+            '{"action":"send","message":"午饭吃了吗？"}',
+        )
+        await scheduler.execute(event)
+        _assert("decorating" in trace and "respond" in trace, "real scheduler skipped a normal downstream stage")
+        _assert(len(context.calls) == 1, "real scheduler SEND did not reach platform exactly once")
+        _assert(context.calls[0].get_plain_text() == expected, "real scheduler sent a non-body result")
+        _assert(event.get_extra("daily_care_committed") is True, "after-send finalizer did not run")
+        _assert(event.get_extra("daily_care_platform_sent") is True, "platform delivery was not confirmed")
+        with sqlite3.connect(care_db.db_path) as conn:
+            send_rows = conn.execute(
+                "SELECT target_id, plan_id, content, channel FROM send_log"
+            ).fetchall()
+        _assert(send_rows == [(71, 0, expected, "care")], f"unexpected isolated send_log rows: {send_rows!r}")
+        with sqlite3.connect(history_db_path) as conn:
+            history_raw = conn.execute(
+                "SELECT history FROM conversation WHERE cid=?",
+                (conversation_id,),
+            ).fetchone()[0]
+        history = json.loads(history_raw)
+        assistant_rows = [item for item in history if item.get("role") == "assistant"]
+        _assert(len(assistant_rows) == 1, f"history writeback was not exactly once: {history!r}")
+        _assert(assistant_rows[0]["content"][0]["text"] == expected, "history contains text other than the exact SEND body")
+        _assert(event.get_extra("daily_care_committed") is True, "successful SEND was not committed by the hook")
+
+        # Repeated transport and callback attempts must not duplicate either
+        # platform delivery, database log, or persisted assistant history.
+        await event.send(MessageChain([Plain(expected)]))
+        await plugin._after_message_sent_care_wake(event)
+        with sqlite3.connect(care_db.db_path) as conn:
+            send_count = conn.execute("SELECT COUNT(*) FROM send_log").fetchone()[0]
+        with sqlite3.connect(history_db_path) as conn:
+            final_history = json.loads(
+                conn.execute(
+                    "SELECT history FROM conversation WHERE cid=?",
+                    (conversation_id,),
+                ).fetchone()[0]
+            )
+        _assert(len(context.calls) == 1, "duplicate transport reached the platform")
+        _assert(send_count == 1, "duplicate after-send callback wrote another send_log row")
+        _assert(sum(item.get("role") == "assistant" for item in final_history) == 1, "duplicate callback wrote history twice")
+        print("PASS: actual PipelineScheduler SEND delivered once and persisted isolated send_log/history")
+
+        # A lower-priority AgentDone handler can stop dispatch after DailyCare
+        # has parsed the response. The scheduler's actual stage progression
+        # still reaches RespondStage; transport must honor the stop flag.
+        agent_context = _Context()
+        agent_event = make_event(agent_context, "scheduler-agent-stop")
+        agent_trace: list[str] = []
+        agent_payloads: list[str | None] = []
+        agent_stopper, agent_stopper_path = _register_stopper(
+            "scheduler-agent-stop", EventType.OnAgentDoneEvent, priority=100
+        )
+        try:
+            await _actual_scheduler(
+                agent_trace,
+                '{"action":"send","message":"不得越过 AgentDone stop"}',
+                agent_payloads,
+            ).execute(agent_event)
+        finally:
+            star_handlers_registry.remove(agent_stopper)
+            star_map.pop(agent_stopper_path, None)
+        _assert(agent_event.is_stopped(), "AgentDone stop_event did not persist")
+        _assert(agent_event.get_extra("daily_care_agent_done_hook_seen") is True, "DailyCare did not run before lower-priority AgentDone stopper")
+        _assert("respond" in agent_trace, "actual PipelineScheduler did not visit RespondStage after AgentDone stop")
+        _assert(not agent_context.calls, "transport bypassed an AgentDone stop_event")
+        _assert(agent_event.get_extra("daily_care_outcome") == "invalid", "stopped AgentDone wake did not fail closed")
+        _assert(agent_event.get_extra("daily_care_platform_sent") is False, "AgentDone stop did not record suppressed transport")
+        print("PASS: actual scheduler reaches RespondStage after AgentDone stop; transport suppresses delivery")
+
+        # If an earlier AgentDone hook prevents DailyCare authorization, an
+        # eligible decorating hook still clears the raw envelope before the
+        # scheduler's outer loop reaches RespondStage. This distinguishes an
+        # AgentDone stop alone from the production log pattern where raw JSON
+        # was observed at RespondStage.
+        early_context = _Context()
+        early_event = make_event(early_context, "scheduler-early-agent-stop")
+        early_trace: list[str] = []
+        early_payloads: list[str | None] = []
+        early_stopper, early_stopper_path = _register_stopper(
+            "scheduler-early-agent-stop",
+            EventType.OnAgentDoneEvent,
+            priority=20_000,
+        )
+        try:
+            await _actual_scheduler(
+                early_trace,
+                '{"action":"send","message":"仅 AgentDone 提前停止"}',
+                early_payloads,
+            ).execute(early_event)
+        finally:
+            star_handlers_registry.remove(early_stopper)
+            star_map.pop(early_stopper_path, None)
+        _assert(early_event.get_extra("daily_care_agent_done_hook_seen") is not True, "earlier stopper did not suppress DailyCare AgentDone hook")
+        _assert(early_event.get_extra("daily_care_decorating_hook_seen") is True, "eligible decorating hook did not run after AgentDone stop")
+        _assert(early_payloads and early_payloads[0] == "", "eligible decorating hook did not clear raw envelope before RespondStage")
+        _assert(not early_context.calls, "early AgentDone stop reached the platform")
+        print("PASS: AgentDone stop alone does not leave raw JSON at Respond when decorating hook remains eligible")
+
+        # A lower-priority decorating handler likewise stops after DailyCare
+        # has sanitized the chain; the transport firewall must still suppress.
+        decorating_context = _Context()
+        decorating_event = make_event(decorating_context, "scheduler-decorating-stop")
+        decorating_trace: list[str] = []
+        decorating_payloads: list[str | None] = []
+        decorating_stopper, decorating_stopper_path = _register_stopper(
+            "scheduler-decorating-stop", EventType.OnDecoratingResultEvent, priority=100
+        )
+        try:
+            await _actual_scheduler(
+                decorating_trace,
+                '{"action":"send","message":"不得越过 Decorating stop"}',
+                decorating_payloads,
+            ).execute(decorating_event)
+        finally:
+            star_handlers_registry.remove(decorating_stopper)
+            star_map.pop(decorating_stopper_path, None)
+        _assert(decorating_event.is_stopped(), "decorating stop_event did not persist")
+        _assert(decorating_event.get_extra("daily_care_decorating_hook_seen") is True, "DailyCare did not run before lower-priority decorating stopper")
+        _assert("respond" in decorating_trace, "actual scheduler did not visit RespondStage after decorating stop")
+        _assert(not decorating_context.calls, "transport bypassed a decorating stop_event")
+        _assert(decorating_event.get_extra("daily_care_outcome") == "invalid", "stopped decorating wake did not fail closed")
+        _assert(decorating_event.get_extra("daily_care_platform_sent") is False, "decorating stop did not record suppressed transport")
+        print("PASS: actual scheduler reaches RespondStage after decorating stop; transport suppresses delivery")
+
+        # Silent, malformed and expired outputs run through the same real
+        # scheduler/RespondStage path and must never produce a platform send.
+        for wake_id, raw, expired, expected_outcome in (
+            ("scheduler-silent", '{"action":"silent","message":""}', False, "silent"),
+            ("scheduler-invalid", "not-json", False, "invalid"),
+            ("scheduler-expired", '{"action":"send","message":"过期正文"}', True, "invalid"),
+        ):
+            safe_context = _Context()
+            safe_event = make_event(safe_context, wake_id)
+            if expired:
+                safe_event.set_extra("daily_care_expired", True)
+            safe_trace: list[str] = []
+            await _actual_scheduler(safe_trace, raw).execute(safe_event)
+            _assert("respond" in safe_trace, f"{wake_id} did not traverse real RespondStage")
+            _assert(not safe_context.calls, f"{wake_id} reached the platform")
+            _assert(safe_event.get_extra("daily_care_outcome") == expected_outcome, f"{wake_id} had wrong terminal outcome")
+            _assert(safe_event.get_extra("daily_care_finalized") is True, f"{wake_id} did not finalize")
+        print("PASS: real scheduler SILENT, invalid, and expired wake paths send nothing")
+
+        # A disabled/filtered authorization hook cannot acquire permission by
+        # falling through to the framework's RespondStage.
+        handlers = {
+            handler.event_type: handler
+            for handler in star_handlers_registry
+            if handler.handler_module_path == PLUGIN_MODULE_PATH
+        }
+        agent_handler = handlers[EventType.OnAgentDoneEvent]
+        decorating_handler = handlers[EventType.OnDecoratingResultEvent]
+        old_enabled = agent_handler.enabled, decorating_handler.enabled
+        try:
+            agent_handler.enabled = False
+            decorating_handler.enabled = False
+            disabled_context = _Context()
+            disabled_event = make_event(disabled_context, "scheduler-disabled-hooks")
+            disabled_trace: list[str] = []
+            await _actual_scheduler(
+                disabled_trace,
+                '{"action":"send","message":"hook 禁用时不得发送"}',
+            ).execute(disabled_event)
+            _assert("respond" in disabled_trace, "disabled-hook case did not reach RespondStage")
+            _assert(not disabled_context.calls, "disabled authorization hooks bypassed transport guard")
+            _assert(disabled_event.get_extra("daily_care_outcome") == "invalid", "disabled hooks were not fail-closed")
+        finally:
+            agent_handler.enabled, decorating_handler.enabled = old_enabled
+        print("PASS: real scheduler with disabled authorization hooks fails closed")
+
+        scoped_context = _Context()
+        scoped_event = make_event(scoped_context, "scheduler-filtered-hooks")
+        scoped_event.plugins_name = ["another_plugin"]
+        scoped_trace: list[str] = []
+        scoped_payloads: list[str | None] = []
+        await _actual_scheduler(
+            scoped_trace,
+            '{"action":"send","message":"范围过滤时不得发送"}',
+            scoped_payloads,
+        ).execute(scoped_event)
+        _assert("respond" in scoped_trace, "filtered-hook case did not reach RespondStage")
+        _assert(
+            '{"action":"send"' in (scoped_payloads[0] or ""),
+            "filtered hooks did not reproduce the unmodified envelope at RespondStage",
+        )
+        _assert(not scoped_context.calls, "filtered authorization hooks bypassed transport guard")
+        _assert(scoped_event.get_extra("daily_care_outcome") == "invalid", "filtered hooks were not fail-closed")
+        print("PASS: event plugin scope filtering fails closed in the actual scheduler")
+
+        with sqlite3.connect(care_db.db_path) as conn:
+            final_send_count = conn.execute("SELECT COUNT(*) FROM send_log").fetchone()[0]
+        _assert(final_send_count == 1, "a stopped/silent/invalid wake changed successful send records")
+        with sqlite3.connect(history_db_path) as conn:
+            final_history = json.loads(
+                conn.execute(
+                    "SELECT history FROM conversation WHERE cid=?",
+                    (conversation_id,),
+                ).fetchone()[0]
+            )
+        _assert(
+            sum(item.get("role") == "assistant" for item in final_history) == 1,
+            "a stopped/silent/invalid wake changed successful assistant history",
+        )
+        print("PASS: suppressed scheduler paths do not add send_log or assistant history")
 
 
 def _decorator_stage():
@@ -216,98 +576,30 @@ def _register_stopper(name: str, event_type: EventType, priority: int):
     return handler, module_path
 
 
-async def _test_agent_done_dispatch_survives_other_plugin_stop(plugin_module) -> None:
-    expected = "午饭吃了吗？"
-    context = _Context()
-    event_class = _build_daily_care_wake_event(CronMessageEvent)
-    event = _new_event(event_class, context, "agent-done-stop")
-    run_context = SimpleNamespace(
-        context=SimpleNamespace(event=event),
-        messages=[
-            SimpleNamespace(role="user", content=[]),
-            SimpleNamespace(role="assistant", content=[]),
-        ],
-    )
-    raw = '{"action":"send","message":"午饭吃了吗？"}'
-    response = LLMResponse(
-        role="assistant",
-        completion_text=raw,
-    )
-    request = SimpleNamespace(func_tool=object(), prompt="")
-    await call_event_hook(event, EventType.OnLLMRequestEvent, request)
-    _assert(request.func_tool is None, "wake-only request tools were not disabled")
-    _assert(event.get_extra("daily_care_tools_disabled") is True, "request hook marker missing")
-    stopper, stopper_path = _register_stopper(
-        "agent_done", EventType.OnAgentDoneEvent, priority=100
-    )
-    try:
-        await MAIN_AGENT_HOOKS.on_agent_done(run_context, response)
-        _assert(
-            event.get_extra("daily_care_outcome") == "send",
-            "Daily Care authorization hook did not run before another plugin stopped dispatch",
-        )
-        _assert(
-            event.get_extra("daily_care_delivered_text") == expected,
-            "authorized body was not bound to the current wake",
-        )
-        _assert(event.is_stopped(), "the higher-priority hook did not stop propagation as expected")
-    finally:
-        star_handlers_registry.remove(stopper)
-        star_map.pop(stopper_path, None)
-
-    event.set_result(MessageEventResult().message(raw))
-    # A stop flag set by OnAgentDone remains on the real AstrMessageEvent.
-    # ResultDecorateStage still invokes its first (highest-priority) handler;
-    # Daily Care must therefore be first to sanitize the raw envelope.
-    await _run_decorating(event)
-    chain = event.get_result().chain
-    _assert(
-        event.get_extra("daily_care_decorating_hook_seen") is True,
-        "Daily Care result decorator did not run after an earlier event stop",
-    )
-    _assert(
-        len(chain) == 1 and isinstance(chain[0], Plain) and chain[0].text == expected,
-        "decorator did not replace the envelope with the exact authorized body",
+def _register_request_rebuilder():
+    module_path = "ci.dailycare_request_rebuilder"
+    star_map[module_path] = StarMetadata(
+        name="CI request rebuilder", author="CI", desc="test", version="0"
     )
 
-    # Independently verify that Daily Care wins ordering when another plugin
-    # stops the decorating event itself.
-    decorating_context = _Context()
-    decorating_event = _new_event(event_class, decorating_context, "decorating-stop")
-    await _run_agent_done(decorating_event, raw)
-    decorating_event.set_result(MessageEventResult().message(raw))
-    decorating_stopper, decorating_stopper_path = _register_stopper(
-        "decorating", EventType.OnDecoratingResultEvent, priority=100
+    async def rebuild(_event, request):
+        request.system_prompt = "rebuilt system context"
+        request.prompt = "<attachment>"
+
+    handler = StarHandlerMetadata(
+        event_type=EventType.OnLLMRequestEvent,
+        handler_full_name=f"{module_path}_rebuild",
+        handler_name="rebuild",
+        handler_module_path=module_path,
+        handler=rebuild,
+        event_filters=[],
+        extras_configs={"priority": 100},
     )
-    try:
-        await _run_decorating(decorating_event)
-        _assert(
-            decorating_event.get_extra("daily_care_decorating_hook_seen") is True,
-            "Daily Care result decorator was not dispatched",
-        )
-        _assert(decorating_event.is_stopped(), "decorating stopper did not stop propagation")
-        chain = decorating_event.get_result().chain
-        _assert(
-            len(chain) == 1 and isinstance(chain[0], Plain) and chain[0].text == expected,
-            "decorator did not replace the envelope with the exact authorized body",
-        )
-        decorating_event.set_extra("daily_care_committed", True)
-        await _run_stage(_respond_stage(), decorating_event)
-        _assert(len(decorating_context.calls) == 1, "decorating-stop SEND was not delivered once")
-    finally:
-        star_handlers_registry.remove(decorating_stopper)
-        star_map.pop(decorating_stopper_path, None)
-
-    event.set_extra("daily_care_committed", True)
-    await _run_stage(_respond_stage(), event)
-    _assert(len(context.calls) == 1, "valid Main Agent SEND was not delivered once")
-    _assert(event.get_extra("daily_care_platform_sent") is True, "platform success not recorded")
-    _assert(event.get_extra("daily_care_after_sent_hook_seen") is True, "after-send hook was not dispatched")
-    await event.send(MessageChain([Plain(expected)]))
-    _assert(len(context.calls) == 1, "duplicate transport reached the platform")
+    star_handlers_registry.append(handler)
+    return handler, module_path
 
 
-async def _test_silent_invalid_disabled_and_transport_fail_closed(plugin_module) -> None:
+async def _test_transport_and_hook_components_fail_closed(plugin_module) -> None:
     event_class = _build_daily_care_wake_event(CronMessageEvent)
     raw_silent = '{"action":"silent","message":""}'
     silent_context = _Context()
@@ -320,7 +612,7 @@ async def _test_silent_invalid_disabled_and_transport_fail_closed(plugin_module)
     _assert(not silent_context.calls, "silent reached the platform")
     _assert(silent_event.get_extra("daily_care_outcome") == "silent", "silent was downgraded")
     _assert(silent_event.get_extra("daily_care_after_sent_hook_seen") is True, "silent lifecycle hook not dispatched")
-    print("PASS: valid SILENT stays silent through ResultDecorateStage and RespondStage")
+    print("PASS: component-level SILENT handling stays silent")
 
     invalid_context = _Context()
     invalid_event = _new_event(event_class, invalid_context, "invalid-json")
@@ -331,7 +623,7 @@ async def _test_silent_invalid_disabled_and_transport_fail_closed(plugin_module)
     _assert(not invalid_event.get_result().chain, "invalid JSON remained in the result")
     await _run_stage(_respond_stage(), invalid_event)
     _assert(not invalid_context.calls, "invalid JSON reached the platform")
-    print("PASS: invalid JSON produces no platform message")
+    print("PASS: component-level invalid JSON produces no platform message")
 
     handlers = {
         handler.event_type: handler
@@ -479,18 +771,33 @@ async def _test_wake_context_reload_and_normal_chat(plugin_module) -> None:
     _assert(wake_event.get_extra("daily_care")["wake_id"] == wake_id, "wake_id lost")
     _assert(len(request.extra_user_content_parts) == 1, "wake fact part missing")
     _assert(request.extra_user_content_parts[0]._no_save is True, "wake fact was not temporary")
-    request.prompt = "<attachment>"
+    original_parts = tuple(request.extra_user_content_parts)
     request.func_tool = object()
-    await call_event_hook(wake_event, EventType.OnLLMRequestEvent, request)
+    rebuilder, rebuilder_path = _register_request_rebuilder()
+    try:
+        await call_event_hook(wake_event, EventType.OnLLMRequestEvent, request)
+    finally:
+        star_handlers_registry.remove(rebuilder)
+        star_map.pop(rebuilder_path, None)
     _assert(request.prompt == "", "attachment sentinel was not removed")
+    _assert(
+        request.system_prompt == "rebuilt system context",
+        "upstream request reconstruction was not applied",
+    )
     _assert(request.func_tool is None, "wake tools were not disabled on actual wake request")
-    _assert(len(request.extra_user_content_parts) == 1, "wake fact was lost during request hook")
-    _assert(request.extra_user_content_parts[0]._no_save is True, "temporary marker was lost during request hook")
+    _assert(
+        request.extra_user_content_parts == list(original_parts),
+        "wake facts were lost during upstream request reconstruction",
+    )
+    _assert(
+        request.extra_user_content_parts[0]._no_save is True,
+        "temporary marker was lost during upstream request reconstruction",
+    )
     channel.cancel_all()
     await wake_event.send(MessageChain([Plain("取消后不得送达")]))
     _assert(not wake_context.sent, "cancelled wake reached the platform")
     print("PASS: wake facts remain temporary ProviderRequest content with current wake_id")
-    print("PASS: request hook preserves temporary facts while applying wake-only safety changes")
+    print("PASS: upstream request reconstruction preserves temporary wake facts and Daily Care safety changes")
     print("PASS: cancelled wake cannot be delivered")
 
     # Simulate AstrBot's active-plugin unbind/reload path using the real manager
@@ -597,12 +904,10 @@ def main() -> None:
     _assert(all(item.enabled for item in registered.values()), "hook unexpectedly disabled")
     _assert(star_map[PLUGIN_MODULE_PATH].activated, "plugin is not activated in registry")
     print("PASS: real Daily Care safety hooks registered, enabled, and activated")
-    asyncio.run(_test_agent_done_dispatch_survives_other_plugin_stop(plugin_module))
+    asyncio.run(_test_real_scheduler_stage_propagation_and_database(_plugin))
     print("PASS: wake-only tools disabled by real OnLLMRequestEvent dispatch")
-    print("PASS: MainAgentHooks dispatch preserved wake authorization")
-    print("PASS: decorating hook produced exact authorized body")
-    print("PASS: exact SEND delivered once; duplicate blocked")
-    asyncio.run(_test_silent_invalid_disabled_and_transport_fail_closed(plugin_module))
+    print("PASS: MainAgentHooks dispatch and real PipelineScheduler stage progression exercised")
+    asyncio.run(_test_transport_and_hook_components_fail_closed(plugin_module))
     asyncio.run(_test_wake_context_reload_and_normal_chat(plugin_module))
 
 

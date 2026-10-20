@@ -1,4 +1,6 @@
-# Minimal imports required by AstrBot v4.25.5 and this plugin's package loader.
+# Minimal imports required by AstrBot v4.25.5/4.26.6 smokes and this plugin loader.
+# PipelineScheduler imports the built-in WebChat and WeCom modules; these two
+# dependencies satisfy their import paths without starting either adapter.
 # Keep MCP on the 1.x API expected by AstrBot 4.25.5 and pin the verified
 # release so the smoke environment stays deterministic.
 aiocqhttp>=1.4.4
@@ -9,6 +11,7 @@ anthropic>=0.51.0
 apscheduler>=3.11.0
 certifi>=2025.4.26
 deprecated>=1.2.18
+fastapi>=0.124.0
 google-genai>=1.56.0
 jieba>=0.42.1
 jsonschema>=4.20.0
@@ -21,6 +24,7 @@ pillow>=11.2.1
 pydantic>=2.12.5,<2.14
 psutil>=5.8.0,<7.2.0
 pypdf>=6.1.1
+pycryptodome>=3.20.0
 pyyaml>=6.0
 rank-bm25>=0.2.2
 sqlalchemy[asyncio]>=2.0.41

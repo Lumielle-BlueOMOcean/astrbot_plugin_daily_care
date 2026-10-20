@@ -582,6 +582,13 @@ def test_wake_event_contract():
             self._extras = kwargs.get("extras", {}).copy()
             self._has_send_oper = False
             self._result = None
+            self._force_stopped = False
+
+        def stop_event(self):
+            self._force_stopped = True
+
+        def is_stopped(self):
+            return self._force_stopped
 
         def get_extra(self, key, default=None):
             return self._extras.get(key, default)
@@ -696,6 +703,24 @@ def test_wake_event_contract():
         asyncio.run(event.send(CoreMessageChain([CorePlain("body")])))
         assert ctx.send_calls == 1
         assert event.get_extra("daily_care_platform_sent") is True
+
+        # AstrBot's scheduler can advance to RespondStage after a hook stops
+        # propagation; the transport must still honor that stop decision.
+        stopped = type(event)(
+            context=ctx,
+            session=Session(),
+            extras={"daily_care": {"kind": "wake", "wake_id": "stopped"}},
+        )
+        stopped.context_obj = ctx
+        stopped.session = Session()
+        stopped.set_extra("daily_care_outcome", "send")
+        stopped.set_extra("daily_care_delivered_text", "body")
+        stopped.stop_event()
+        before_stopped_send = ctx.send_calls
+        asyncio.run(stopped.send(CoreMessageChain([CorePlain("body")])))
+        assert ctx.send_calls == before_stopped_send
+        assert stopped.get_extra("daily_care_platform_sent") is False
+        assert stopped.get_extra("daily_care_outcome") == "invalid"
 
         # InternalAgentSubStage 的错误路径可能在 after_message_sent hook
         # 之前直接调用 event.send；transport failure 自身必须完成收尾。

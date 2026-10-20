@@ -190,6 +190,10 @@ def _build_daily_care_wake_event(cron_event_cls):
                 )
                 return
 
+            if self.is_stopped():
+                self._reject_transport("event propagation stopped before transport")
+                return
+
             if self.get_extra("daily_care_outcome") == "silent":
                 # A valid SILENT is a terminal no-send decision, not a failed
                 # authorization attempt. Keep it distinguishable from an
