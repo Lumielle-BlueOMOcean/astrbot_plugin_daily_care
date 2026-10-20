@@ -133,9 +133,18 @@ def _build_daily_care_wake_event(cron_event_cls):
             if tracker is not None:
                 tracker.transport_failed(self, reason)
             self._clear_result()
+            plugins_name = getattr(self, "plugins_name", None)
+            if plugins_name is None or plugins_name == ["*"]:
+                plugin_scope = "all"
+            else:
+                plugin_scope = f"restricted:{len(plugins_name)}"
             logger.warning(
                 f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
-                f"未授权 transport 已抑制: {reason}"
+                f"未授权 transport 已抑制: {reason}; "
+                f"request_hook={self.get_extra('daily_care_request_hook_seen') is True} "
+                f"agent_done_hook={self.get_extra('daily_care_agent_done_hook_seen') is True} "
+                f"decorating_hook={self.get_extra('daily_care_decorating_hook_seen') is True} "
+                f"plugin_scope={plugin_scope}"
             )
 
         @staticmethod
@@ -181,12 +190,31 @@ def _build_daily_care_wake_event(cron_event_cls):
                 )
                 return
 
+            if self.get_extra("daily_care_outcome") == "silent":
+                # A valid SILENT is a terminal no-send decision, not a failed
+                # authorization attempt. Keep it distinguishable from an
+                # invalid/missing hook and avoid one WARN for every silence.
+                self.set_extra("daily_care_platform_sent", False)
+                self.set_extra("daily_care_delivered_text", "")
+                self._mark_wake_stage("silent_suppressed")
+                self._clear_result()
+                logger.info(
+                    f"[DailyCare] wake_id={self.get_extra('daily_care', {}).get('wake_id', '')} "
+                    "stage=transport_suppressed outcome=silent"
+                )
+                return
+
             valid, reason = self._is_exact_authorized_message(
                 message,
                 self.get_extra("daily_care_outcome"),
                 self.get_extra("daily_care_delivered_text"),
             )
             if not valid:
+                if self.get_extra("daily_care_outcome") is None:
+                    if self.get_extra("daily_care_agent_done_hook_seen") is True:
+                        reason = "agent_done_hook_ran_without_send_authorization"
+                    else:
+                        reason = "agent_done_hook_not_observed"
                 self._reject_transport(reason)
                 return
 

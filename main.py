@@ -36,6 +36,7 @@ from .core.wake_protocol import parse_wake_output
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_NAME = "astrbot_plugin_daily_care"
+CARE_WAKE_HOOK_PRIORITY = 10_000
 
 
 def _resolve_data_dir() -> str:
@@ -482,6 +483,10 @@ class DailyCarePlugin(Star):
                 logger.warning(f"[DailyCare] 冷场主动异常: {e}")
 
     # ---------- Daily Care wake 安全边界 ----------
+    # AstrBot dispatches higher-priority hooks first and stops the chain when a
+    # hook calls event.stop_event(). Run authorization/final-result lifecycle
+    # hooks first so a different plugin cannot skip them. Keep the request
+    # hook's established priority (60) to preserve request-composer ordering.
     @filter.on_llm_request(priority=60)
     async def _on_llm_request_care_wake(self, event: AstrMessageEvent, request):
         """Restrict only Daily Care wakes to the two-state action space."""
@@ -489,6 +494,7 @@ class DailyCarePlugin(Star):
             care = event.get_extra("daily_care")
             if not isinstance(care, dict) or care.get("kind") != "wake":
                 return
+            event.set_extra("daily_care_request_hook_seen", True)
             logger.info(
                 f"[DailyCare] wake_id={care.get('wake_id', '')} stage=agent_running"
             )
@@ -545,11 +551,12 @@ class DailyCarePlugin(Star):
         if plan_id:
             self.db.mark_plan(plan_id, "skipped")
 
-    @filter.on_agent_done()
+    @filter.on_agent_done(priority=CARE_WAKE_HOOK_PRIORITY)
     async def _on_agent_done_care_wake(self, event: AstrMessageEvent, run_context, response):
         care = self._care_wake_info(event)
         if care is None:
             return
+        event.set_extra("daily_care_agent_done_hook_seen", True)
         wake_id = str(care.get("wake_id") or "")
         tracker = event.get_extra("daily_care_tracker")
         if (
@@ -606,11 +613,12 @@ class DailyCarePlugin(Star):
             f"[DailyCare] wake_id={wake_id} stage=agent_done outcome={outcome}"
         )
 
-    @filter.on_decorating_result()
+    @filter.on_decorating_result(priority=CARE_WAKE_HOOK_PRIORITY)
     async def _on_decorating_result_care_wake(self, event: AstrMessageEvent):
         care = self._care_wake_info(event)
         if care is None:
             return
+        event.set_extra("daily_care_decorating_hook_seen", True)
         outcome = event.get_extra("daily_care_outcome")
         result = event.get_result()
         if result is None:
@@ -690,11 +698,12 @@ class DailyCarePlugin(Star):
             f"conversation_id={conversation_id}"
         )
 
-    @filter.after_message_sent()
+    @filter.after_message_sent(priority=CARE_WAKE_HOOK_PRIORITY)
     async def _after_message_sent_care_wake(self, event: AstrMessageEvent):
         care = self._care_wake_info(event)
         if care is None:
             return
+        event.set_extra("daily_care_after_sent_hook_seen", True)
         wake_id = str(care.get("wake_id") or "")
         if event.get_extra("daily_care_finalized"):
             return

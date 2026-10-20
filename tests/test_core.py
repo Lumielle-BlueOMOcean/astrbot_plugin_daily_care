@@ -762,12 +762,12 @@ def test_wake_event_contract():
         assert unauthorized.get_result().chain == []
 
         # SILENT/INVALID 以及正文不匹配、额外组件都必须拒绝。
-        for outcome, delivered, outgoing in (
-            ("silent", "", [CorePlain("任何内容")]),
-            ("invalid", "", [CorePlain("任何内容")]),
-            ("send", "午饭吃了吗？", [CorePlain("晚饭吃了吗？")]),
-            ("send", "午饭吃了吗？", [CorePlain("午饭吃了吗？"), CorePlain("内部状态")]),
-            ("send", "午饭吃了吗？", [CoreOtherComponent()]),
+        for outcome, delivered, outgoing, expected_outcome in (
+            ("silent", "", [CorePlain("任何内容")], "silent"),
+            ("invalid", "", [CorePlain("任何内容")], "invalid"),
+            ("send", "午饭吃了吗？", [CorePlain("晚饭吃了吗？")], "invalid"),
+            ("send", "午饭吃了吗？", [CorePlain("午饭吃了吗？"), CorePlain("内部状态")], "invalid"),
+            ("send", "午饭吃了吗？", [CoreOtherComponent()], "invalid"),
         ):
             blocked = type(event)(
                 context=ctx,
@@ -782,7 +782,7 @@ def test_wake_event_contract():
             asyncio.run(blocked.send(CoreMessageChain(outgoing)))
             assert ctx.send_calls == before
             assert blocked.get_extra("daily_care_platform_sent") is False
-            assert blocked.get_extra("daily_care_outcome") == "invalid"
+            assert blocked.get_extra("daily_care_outcome") == expected_outcome
             assert blocked.get_result().chain == []
 
         # Context.send_message 抛错时不产生成功标记。
