@@ -145,6 +145,12 @@ class _AgentCompletionStage:
             ],
         )
         await MAIN_AGENT_HOOKS.on_agent_done(run_context, response)
+        # Match AstrBot 4.26.6 run_agent(): once stop_event() is set during
+        # on_agent_done, the final llm_result is skipped instead of being
+        # installed as an event result or yielded into the scheduler.
+        if event.is_stopped():
+            self.trace.append("agent_stopped_without_final_result")
+            return
         event.set_result(MessageEventResult().message(response.completion_text))
         self.trace.append("agent_result")
         yield
@@ -329,8 +335,8 @@ async def _test_real_scheduler_stage_propagation_and_database(plugin) -> None:
         print("PASS: actual PipelineScheduler SEND delivered once and persisted isolated send_log/history")
 
         # A lower-priority AgentDone handler can stop dispatch after DailyCare
-        # has parsed the response. The scheduler's actual stage progression
-        # still reaches RespondStage; transport must honor the stop flag.
+        # has parsed the response. AstrBot's runner then skips the final result,
+        # while PipelineScheduler's outer loop still advances to RespondStage.
         agent_context = _Context()
         agent_event = make_event(agent_context, "scheduler-agent-stop")
         agent_trace: list[str] = []
@@ -350,16 +356,15 @@ async def _test_real_scheduler_stage_propagation_and_database(plugin) -> None:
         _assert(agent_event.is_stopped(), "AgentDone stop_event did not persist")
         _assert(agent_event.get_extra("daily_care_agent_done_hook_seen") is True, "DailyCare did not run before lower-priority AgentDone stopper")
         _assert("respond" in agent_trace, "actual PipelineScheduler did not visit RespondStage after AgentDone stop")
-        _assert(not agent_context.calls, "transport bypassed an AgentDone stop_event")
-        _assert(agent_event.get_extra("daily_care_outcome") == "invalid", "stopped AgentDone wake did not fail closed")
-        _assert(agent_event.get_extra("daily_care_platform_sent") is False, "AgentDone stop did not record suppressed transport")
-        print("PASS: actual scheduler reaches RespondStage after AgentDone stop; transport suppresses delivery")
+        _assert("agent_stopped_without_final_result" in agent_trace, "stopped Main Agent emitted a final result")
+        _assert(agent_payloads == [""], f"RespondStage received unexpected result after AgentDone stop: {agent_payloads!r}")
+        _assert(not agent_context.calls, "AgentDone stop unexpectedly reached the platform")
+        print("PASS: scheduler advances after AgentDone stop, but runner leaves no final result to send")
 
-        # If an earlier AgentDone hook prevents DailyCare authorization, an
-        # eligible decorating hook still clears the raw envelope before the
-        # scheduler's outer loop reaches RespondStage. This distinguishes an
-        # AgentDone stop alone from the production log pattern where raw JSON
-        # was observed at RespondStage.
+        # If an earlier AgentDone hook prevents DailyCare authorization, stop
+        # creates an empty stop result and the runner skips the final response.
+        # ResultDecorateStage returns before dispatching hooks for an empty
+        # chain, so this alone cannot explain raw JSON at RespondStage.
         early_context = _Context()
         early_event = make_event(early_context, "scheduler-early-agent-stop")
         early_trace: list[str] = []
@@ -379,10 +384,10 @@ async def _test_real_scheduler_stage_propagation_and_database(plugin) -> None:
             star_handlers_registry.remove(early_stopper)
             star_map.pop(early_stopper_path, None)
         _assert(early_event.get_extra("daily_care_agent_done_hook_seen") is not True, "earlier stopper did not suppress DailyCare AgentDone hook")
-        _assert(early_event.get_extra("daily_care_decorating_hook_seen") is True, "eligible decorating hook did not run after AgentDone stop")
-        _assert(early_payloads and early_payloads[0] == "", "eligible decorating hook did not clear raw envelope before RespondStage")
+        _assert(early_event.get_extra("daily_care_decorating_hook_seen") is not True, "empty-result decoration unexpectedly dispatched authorization hook")
+        _assert(early_payloads == [""], f"AgentDone stop unexpectedly left raw text for RespondStage: {early_payloads!r}")
         _assert(not early_context.calls, "early AgentDone stop reached the platform")
-        print("PASS: AgentDone stop alone does not leave raw JSON at Respond when decorating hook remains eligible")
+        print("PASS: AgentDone stop alone does not leave raw JSON at RespondStage")
 
         # A lower-priority decorating handler likewise stops after DailyCare
         # has sanitized the chain; the transport firewall must still suppress.
