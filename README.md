@@ -6,7 +6,7 @@
 [![AstrBot Plugin](https://img.shields.io/badge/AstrBot-Plugin-blue)](https://github.com/Soulter/AstrBot)
 [![CI](https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_daily_care/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lumielle-BlueOMOcean/astrbot_plugin_daily_care/actions/workflows/ci.yml)
 
-> 当前版本：**v1.1.14**
+> 当前版本：**v1.1.15**
 
 ## 🌟 核心特性
 
@@ -45,7 +45,7 @@
 
 ## 更新日志
 
-### v1.1.14
+### v1.1.15
 
 本版本集中改进主动关怀稳定性、数据升级保护和运行兼容性。
 
